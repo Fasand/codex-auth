@@ -538,4 +538,4 @@ if [[ $skip_completions -eq 0 ]]; then
 fi
 
 echo
-echo "To update later, run the same install command again."
+echo "To update later, run codex-auth update or run the same install command again."

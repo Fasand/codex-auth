@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.2.2"
+APP_VERSION="0.3.0"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -10,6 +10,7 @@ CURRENT_PROFILE_FILE="$ACCOUNTS_DIR/current_profile"
 SESSIONS_DIR="${CODEX_AUTH_SESSIONS_DIR:-$CODEX_HOME/sessions}"
 DEFAULT_USAGE_URL="https://chatgpt.com/backend-api/codex/usage"
 FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_INSTALL_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
 
 usage() {
   cat <<USAGE
@@ -25,6 +26,7 @@ Commands:
   add <name>                Run codex login, then save the result as <name>
   refresh-usage <name>      Query live usage for one saved profile
   refresh-usage --all       Query live usage for all saved profiles
+  update                    Update this installed codex-auth via install.sh
   rename <old> <new>        Rename a saved profile
   remove <name>             Delete a saved profile snapshot
   version                   Show the codex-auth version
@@ -32,6 +34,7 @@ Commands:
 
 Environment:
   CODEX_HOME                Override Codex home (default: ~/.codex)
+  CODEX_AUTH_INSTALL_FROM   Override installer source for self-update/advanced installs
   CODEX_AUTH_USAGE_URL      Override usage endpoint URL for testing/custom routing
   CODEX_AUTH_SESSIONS_DIR   Override sessions directory for session snapshot parsing
 USAGE
@@ -48,6 +51,14 @@ die() {
 
 note() {
   echo "$*" >&2
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_cmd() {
+  have_cmd "$1" || die "Required command not found: $1"
 }
 
 ensure_dirs() {
@@ -805,6 +816,74 @@ refresh_usage_command() {
   render_profile_line "$target" "$(find_matching_profile || true)"
 }
 
+resolve_current_executable_path() {
+  local script_ref=${1:-${BASH_SOURCE[0]:-$0}}
+  python3 - "$script_ref" <<'PY'
+import os
+import shutil
+import sys
+
+script_ref = sys.argv[1]
+if "/" not in script_ref:
+    resolved = shutil.which(script_ref)
+else:
+    resolved = script_ref
+
+if not resolved:
+    raise SystemExit(1)
+
+print(os.path.realpath(resolved))
+PY
+}
+
+update_self() {
+  require_cmd python3
+  require_cmd curl
+
+  local from_base installer_url script_path bin_dir parent_dir completion_dir installer_path
+  local -a installer_args
+
+  from_base="${CODEX_AUTH_INSTALL_FROM:-$DEFAULT_INSTALL_FROM_BASE}"
+  from_base=${from_base%/}
+  installer_url="$from_base/install.sh"
+
+  script_path=$(resolve_current_executable_path "${BASH_SOURCE[0]:-$0}") || die "Unable to resolve the current executable path"
+  bin_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd -P)
+  parent_dir=$(CDPATH= cd -- "$bin_dir/.." && pwd -P)
+
+  if [[ -f "$parent_dir/install.sh" && -f "$parent_dir/bin/codex-auth" && -f "$parent_dir/completions/codex-auth.bash" ]]; then
+    die "codex-auth update is for installed copies; in a local checkout, run ./install.sh instead"
+  fi
+
+  installer_args=(--bin-dir "$bin_dir")
+
+  if [[ "$(basename -- "$bin_dir")" == "bin" ]]; then
+    completion_dir="$parent_dir/share/bash-completion/completions"
+    if [[ -f "$completion_dir/codex-auth" ]]; then
+      installer_args+=(--completion-dir "$completion_dir")
+    else
+      installer_args+=(--skip-completions)
+    fi
+  else
+    installer_args+=(--skip-completions)
+  fi
+
+  installer_path=$(mktemp "${TMPDIR:-/tmp}/codex-auth-install.XXXXXX") || die "Failed to allocate a temporary installer path"
+  if ! curl -fsSL "$installer_url" -o "$installer_path"; then
+    rm -f "$installer_path"
+    die "Failed to download installer from $installer_url"
+  fi
+
+  note "Updating codex-auth from $from_base"
+  if bash "$installer_path" "${installer_args[@]}"; then
+    rm -f "$installer_path"
+  else
+    local status=$?
+    rm -f "$installer_path"
+    return "$status"
+  fi
+}
+
 main() {
   local cmd=${1:-help}
   case "$cmd" in
@@ -838,6 +917,11 @@ main() {
       shift
       [[ $# -eq 1 ]] || die "Usage: codex-auth refresh-usage <name>|--all"
       refresh_usage_command "$1"
+      ;;
+    update)
+      shift
+      [[ $# -eq 0 ]] || die "Usage: codex-auth update"
+      update_self
       ;;
     rename)
       shift

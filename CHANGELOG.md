@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.3.0 - 2026-03-19
+
+- Added a new `codex-auth update` command that self-updates via the existing installer without cloning the repository.
+- Updated the help text, README, installer messaging, and Bash completions to document the new self-update path alongside the existing install-script flow.
+- Clarified in `AGENTS.md` that slash-style branch names work and that sandboxed Codex sessions may need elevated Git permissions to create branches.
+
 ## 0.2.2 - 2026-03-19
 
 - Added this historical changelog so releases are tracked by version instead of by commit.
