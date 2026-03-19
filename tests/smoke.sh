@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.2.1"
+EXPECTED_VERSION="0.2.2"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -51,6 +51,7 @@ test_readme_points_to_the_default_installer_command() {
   local readme
   readme=$(cat "$ROOT_DIR/README.md")
   assert_contains "$readme" "bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)"
+  assert_contains "$readme" "See [CHANGELOG.md](CHANGELOG.md) for release history."
 }
 
 test_version_flag_reports_the_current_version() {
@@ -98,6 +99,21 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
   assert_contains "$script" 'array_contains "python3" "missing_required_runtime"'
   assert_contains "$script" 'local count=0'
   assert_contains "$script" 'eval "count=\${#${array_name}[@]}"'
+}
+
+test_changelog_tracks_the_current_release_newest_first() {
+  local changelog
+  changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-03-19"
+  assert_contains "$changelog" "## 0.1.0 - 2026-03-19"
+}
+
+test_agents_md_captures_repo_workflow() {
+  local agents
+  agents=$(cat "$ROOT_DIR/AGENTS.md")
+  assert_contains "$agents" 'Do not work directly on `main`.'
+  assert_contains "$agents" 'Every PR should include a short self-test command'
+  assert_contains "$agents" 'Maintain `CHANGELOG.md` newest-first.'
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -150,6 +166,8 @@ main() {
   test_list_works_without_column
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
+  test_changelog_tracks_the_current_release_newest_first
+  test_agents_md_captures_repo_workflow
 }
 
 main "$@"
