@@ -33,6 +33,3 @@ Small CLI for saving, switching, listing, and refreshing multiple ChatGPT Codex 
   - `bash tests/smoke.sh`
 - PR checks should run on the PR itself; pushes to `main` validate post-merge.
 
-## Related repo
-
-- If `reference-architecture` should follow the latest `codex-auth`, update its `bin/codex-auth` submodule pointer in a separate commit after the relevant `codex-auth` change is merged.
