@@ -8,6 +8,7 @@ Small CLI for saving, switching, listing, and refreshing multiple ChatGPT Codex 
 - Start from an up-to-date `main`, then create a short branch such as `feat/<slug>`, `fix/<slug>`, `docs/<slug>`, or `chore/<slug>`.
 - Slash-style branch names like `feat/<slug>` work normally; in sandboxed Codex sessions, branch creation may need elevated Git permissions because Git must write under `.git/refs`.
 - Leave changes uncommitted by default and wait for the user to explicitly say to continue before committing, pushing, or opening a PR.
+- For GitHub-related operations in Codex sessions, prefer the locally authenticated command-line tools over connector/integration actions because the local CLI auth is the source of truth for the correct user and permissions.
 - Open a PR for every change.
 - Every PR should include a short self-test command that installs from that exact branch, for example:
   - `bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/<branch>/install.sh) --from https://raw.githubusercontent.com/Fasand/codex-auth/<branch> --prefix "$HOME/.local/codex-auth-pr-test"`
