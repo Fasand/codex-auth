@@ -34,6 +34,8 @@ This installs:
 - `codex-auth` to `~/.local/bin/codex-auth`
 - Bash completions to `~/.local/share/bash-completion/completions/codex-auth`
 
+You can change the destination with `--prefix`, `--bin-dir`, `--completion-dir`, or skip completions entirely with `--skip-completions`.
+
 ### Without cloning the repo
 
 Once this repository is published, you can install it directly from the raw files:
