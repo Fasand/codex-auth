@@ -48,6 +48,42 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+use_color() {
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+  [[ "${FORCE_COLOR:-}" == "1" || "${FORCE_COLOR:-}" == "true" || "${FORCE_COLOR:-}" == "always" ]] && return 0
+  [[ -t 1 ]]
+}
+
+paint() {
+  local code=$1
+  local text=$2
+  if use_color; then
+    printf '\033[%sm%s\033[0m' "$code" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+status_icon() {
+  local state=$1
+  case "$state" in
+    ok) printf '%s' "✅" ;;
+    missing) printf '%s' "❌" ;;
+    *) printf '%s' "$state" ;;
+  esac
+}
+
+print_status_line() {
+  local state=$1
+  local label=$2
+  local detail=${3:-}
+  printf '  [%s] %s' "$(status_icon "$state")" "$label"
+  if [[ -n "$detail" ]]; then
+    printf ' — %s' "$detail"
+  fi
+  printf '\n'
+}
+
 join_by() {
   local sep=$1
   shift || true
@@ -85,6 +121,16 @@ print_section() {
   for item in "$@"; do
     echo "  - $item"
   done
+}
+
+array_contains() {
+  local needle=$1
+  shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 detect_os() {
@@ -311,22 +357,51 @@ collect_dependency_state() {
 
 print_dependency_report() {
   collect_dependency_state
-  echo "Dependency report"
-  echo "  OS: $os_name"
-  echo "  Package manager: ${package_manager:-not detected}"
-  echo "  Source mode: $([[ $remote_mode -eq 1 ]] && echo remote || echo local-checkout)"
-  echo
-  print_section "Required runtime" "bash (script runtime)" "python3" "codex CLI"
-  echo
-  print_section "Missing required runtime" "${missing_required_runtime[@]}"
-  echo
-  print_section "Missing manual prerequisites" "${missing_manual_prereqs[@]}"
-  echo
-  print_section "Optional extras that improve UX" "column (prettier tables; the tool will fall back without it)" "fzf (interactive picker)" "bash-completion support (auto-loading completions)"
-  echo
-  print_section "Missing optional extras" "${missing_optional[@]}"
-  echo
-  print_section "Installable now on this system" "${installable_packages[@]}"
+  printf 'Dependency check (%s, %s, %s)\n' "$os_name" "${package_manager:-no package manager detected}" "$([[ $remote_mode -eq 1 ]] && echo remote || echo local-checkout)"
+  echo "Required"
+  if array_contains "python3" "${missing_required_runtime[@]}"; then
+    print_status_line "missing" "python3"
+  else
+    print_status_line "ok" "python3"
+  fi
+  if array_contains "codex CLI (manual prerequisite)" "${missing_manual_prereqs[@]}"; then
+    print_status_line "missing" "codex CLI" "manual prerequisite"
+  else
+    print_status_line "ok" "codex CLI"
+  fi
+  if [[ $remote_mode -eq 1 ]]; then
+    if array_contains "curl (required for remote install/update)" "${missing_required_runtime[@]}"; then
+      print_status_line "missing" "curl" "required for remote install/update"
+    else
+      print_status_line "ok" "curl" "required for remote install/update"
+    fi
+  fi
+
+  echo "Optional"
+  if have_cmd column; then
+    print_status_line "ok" "column" "prettier tables"
+  else
+    print_status_line "missing" "column" "plain aligned table fallback is built in"
+  fi
+  if array_contains "fzf (optional interactive picker)" "${missing_optional[@]}"; then
+    print_status_line "missing" "fzf" "interactive picker"
+  else
+    print_status_line "ok" "fzf" "interactive picker"
+  fi
+  if [[ $skip_completions -eq 0 ]]; then
+    if array_contains "bash-completion support (optional auto-loading for completions)" "${missing_optional[@]}"; then
+      print_status_line "missing" "bash-completion" "auto-loading completions"
+    else
+      print_status_line "ok" "bash-completion" "auto-loading completions"
+    fi
+  fi
+
+  if [[ ${#installable_packages[@]} -gt 0 ]]; then
+    printf 'Install with --install-deps: %s\n' "$(join_by ', ' "${installable_packages[@]}")"
+  fi
+  if [[ ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+    echo "Manual step: install the Codex CLI yourself."
+  fi
   if [[ ${#missing_required_runtime[@]} -gt 0 || ${#missing_manual_prereqs[@]} -gt 0 ]]; then
     return 1
   fi

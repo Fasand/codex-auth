@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.2.0"
+EXPECTED_VERSION="0.2.1"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -60,10 +60,27 @@ test_version_flag_reports_the_current_version() {
 }
 
 test_dependency_check_reports_runtime_requirements() {
-  local output
-  output=$(bash "$ROOT_DIR/install.sh" --check-deps --skip-completions 2>&1 || true)
-  assert_contains "$output" "Required runtime"
+  local stub_codex_dir output line_count
+  stub_codex_dir=$(make_stub_codex_dir)
+  output=$(PATH="$stub_codex_dir:$PATH" bash "$ROOT_DIR/install.sh" --check-deps --skip-completions)
+  assert_contains "$output" "Dependency check ("
+  assert_contains "$output" "python3"
   assert_contains "$output" "codex CLI"
+  line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+  [[ "$line_count" -le 10 ]] || fail "expected compact dependency output, got $line_count lines"
+}
+
+test_dependency_check_uses_clear_red_green_status_markers() {
+  local output
+  output=$(PATH="/usr/bin:/bin" FORCE_COLOR=1 bash "$ROOT_DIR/install.sh" --check-deps --skip-completions 2>&1 || true)
+  assert_contains "$output" "❌"
+  assert_contains "$output" "codex CLI"
+}
+
+test_workflow_uses_node24_ready_checkout() {
+  local workflow
+  workflow=$(cat "$ROOT_DIR/.github/workflows/smoke.yml")
+  assert_contains "$workflow" "actions/checkout@v6"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -110,9 +127,11 @@ main() {
   test_readme_points_to_the_default_installer_command
   test_version_flag_reports_the_current_version
   test_dependency_check_reports_runtime_requirements
+  test_dependency_check_uses_clear_red_green_status_markers
   test_remote_style_install_works_without_from_flag
   test_re_running_the_installer_updates_in_place
   test_list_works_without_column
+  test_workflow_uses_node24_ready_checkout
 }
 
 main "$@"

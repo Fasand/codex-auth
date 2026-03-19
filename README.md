@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.2.0`
+Current version: `0.2.1`
 
 ## What it does
 
@@ -66,6 +66,8 @@ Check the current machine without installing anything:
 ```bash
 ./install.sh --check-deps
 ```
+
+`--check-deps` prints a short status view with green/red indicators so you can quickly see what is available and what is missing.
 
 Install supported dependencies non-interactively:
 
