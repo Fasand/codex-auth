@@ -125,9 +125,13 @@ print_section() {
 
 array_contains() {
   local needle=$1
-  shift
+  local array_name=$2
   local item
-  for item in "$@"; do
+  local items=()
+  set +u
+  eval "items=(\"\${${array_name}[@]}\")"
+  set -u
+  for item in "${items[@]}"; do
     [[ "$item" == "$needle" ]] && return 0
   done
   return 1
@@ -368,18 +372,18 @@ print_dependency_report() {
   collect_dependency_state
   printf 'Dependency check (%s, %s, %s)\n' "$os_name" "${package_manager:-no package manager detected}" "$([[ $remote_mode -eq 1 ]] && echo remote || echo local-checkout)"
   echo "Required"
-  if array_contains "python3" "${missing_required_runtime[@]}"; then
+  if array_contains "python3" "missing_required_runtime"; then
     print_status_line "missing" "python3"
   else
     print_status_line "ok" "python3"
   fi
-  if array_contains "codex CLI (manual prerequisite)" "${missing_manual_prereqs[@]}"; then
+  if array_contains "codex CLI (manual prerequisite)" "missing_manual_prereqs"; then
     print_status_line "missing" "codex CLI" "manual prerequisite"
   else
     print_status_line "ok" "codex CLI"
   fi
   if [[ $remote_mode -eq 1 ]]; then
-    if array_contains "curl (required for remote install/update)" "${missing_required_runtime[@]}"; then
+    if array_contains "curl (required for remote install/update)" "missing_required_runtime"; then
       print_status_line "missing" "curl" "required for remote install/update"
     else
       print_status_line "ok" "curl" "required for remote install/update"
@@ -392,13 +396,13 @@ print_dependency_report() {
   else
     print_status_line "missing" "column" "plain aligned table fallback is built in"
   fi
-  if array_contains "fzf (optional interactive picker)" "${missing_optional[@]}"; then
+  if array_contains "fzf (optional interactive picker)" "missing_optional"; then
     print_status_line "missing" "fzf" "interactive picker"
   else
     print_status_line "ok" "fzf" "interactive picker"
   fi
   if [[ $skip_completions -eq 0 ]]; then
-    if array_contains "bash-completion support (optional auto-loading for completions)" "${missing_optional[@]}"; then
+    if array_contains "bash-completion support (optional auto-loading for completions)" "missing_optional"; then
       print_status_line "missing" "bash-completion" "auto-loading completions"
     else
       print_status_line "ok" "bash-completion" "auto-loading completions"
