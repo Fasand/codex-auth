@@ -133,6 +133,15 @@ array_contains() {
   return 1
 }
 
+array_len() {
+  local array_name=$1
+  local len=0
+  set +u
+  eval "len=\${#${array_name}[@]}"
+  set -u
+  printf '%s\n' "$len"
+}
+
 detect_os() {
   case "$(uname -s)" in
     Darwin) echo "macos" ;;
@@ -396,13 +405,13 @@ print_dependency_report() {
     fi
   fi
 
-  if [[ ${#installable_packages[@]} -gt 0 ]]; then
+  if (( $(array_len installable_packages) > 0 )); then
     printf 'Install with --install-deps: %s\n' "$(join_by ', ' "${installable_packages[@]}")"
   fi
-  if [[ ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+  if (( $(array_len missing_manual_prereqs) > 0 )); then
     echo "Manual step: install the Codex CLI yourself."
   fi
-  if [[ ${#missing_required_runtime[@]} -gt 0 || ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+  if (( $(array_len missing_required_runtime) > 0 || $(array_len missing_manual_prereqs) > 0 )); then
     return 1
   fi
   return 0
@@ -410,7 +419,7 @@ print_dependency_report() {
 
 offer_or_install_dependencies() {
   collect_dependency_state
-  [[ ${#installable_packages[@]} -gt 0 ]] || return 0
+  (( $(array_len installable_packages) > 0 )) || return 0
 
   if [[ $install_deps -eq 1 ]]; then
     note "Installing supported dependencies with ${package_manager:-unknown package manager}: $(join_by ', ' "${installable_packages[@]}")"
@@ -458,14 +467,14 @@ fi
 offer_or_install_dependencies
 collect_dependency_state
 
-if [[ ${#missing_required_runtime[@]} -gt 0 || ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+if (( $(array_len missing_required_runtime) > 0 || $(array_len missing_manual_prereqs) > 0 )); then
   echo
   print_dependency_report || true
   echo
-  if [[ ${#installable_packages[@]} -gt 0 && -n "$package_manager" ]]; then
+  if (( $(array_len installable_packages) > 0 )) && [[ -n "$package_manager" ]]; then
     echo "Re-run with --install-deps to install supported dependencies automatically."
   fi
-  if [[ ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+  if (( $(array_len missing_manual_prereqs) > 0 )); then
     echo "The Codex CLI remains a manual prerequisite and is not installed by this script."
   fi
   die "Cannot continue until the required prerequisites are available"
