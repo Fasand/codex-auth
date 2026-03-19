@@ -4,6 +4,8 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
+Current version: `0.2.0`
+
 ## What it does
 
 - Save the current Codex auth snapshot as a named profile
@@ -12,18 +14,39 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 - Refresh live usage data for one or all profiles
 - Add Bash completion support for common commands and saved profile names
 
-## Requirements
+## Prerequisites
+
+These must already exist before `codex-auth` is usable:
 
 - Bash
-- Python 3
-- The `codex` CLI already installed and working
-- `column` for table formatting (usually available by default)
-- Optional: `fzf` for nicer interactive profile switching
-- Optional: `curl` for no-clone installs via `install.sh --from ...`
+- The `codex` CLI installed and working
+
+## Installer-managed dependencies
+
+The installer can check for and, on supported systems, best-effort install these dependencies:
+
+- `python3` for the utility's JSON and network helpers
+- `curl` for no-clone installs and updates
+- `fzf` for the nicer interactive profile picker
+- Bash completion support for auto-loading completions
+
+Notes:
+
+- `column` is optional. If it is missing, `codex-auth list` falls back to a plain aligned table.
+- `install.sh --install-deps` currently supports Homebrew, `apt-get`, `dnf`, and `pacman`.
+- The installer does **not** install the `codex` CLI for you.
 
 ## Install
 
-### From a local checkout
+### Fast install from GitHub
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)
+```
+
+If dependencies are missing, the installer will report them and, in an interactive shell, offer to install supported ones.
+
+### Local checkout install
 
 ```bash
 ./install.sh
@@ -36,13 +59,24 @@ This installs:
 
 You can change the destination with `--prefix`, `--bin-dir`, `--completion-dir`, or skip completions entirely with `--skip-completions`.
 
-### Without cloning the repo
+## Dependency checks
 
-Once this repository is published, you can install it directly from the raw files:
+Check the current machine without installing anything:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
-  --from https://raw.githubusercontent.com/Fasand/codex-auth/main
+./install.sh --check-deps
+```
+
+Install supported dependencies non-interactively:
+
+```bash
+./install.sh --install-deps
+```
+
+Remote install plus dependency installation:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) --install-deps
 ```
 
 ## Update
@@ -56,8 +90,24 @@ Examples:
 ```
 
 ```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)
+```
+
+Existing installations continue to update in place; you do not need to remove anything first.
+
+## Custom sources and forks
+
+By default, the installer downloads from this repository's `main` branch. If you are testing a fork or a different raw file base, override it with `--from` or `CODEX_AUTH_INSTALL_FROM`.
+
+Examples:
+
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
-  --from https://raw.githubusercontent.com/Fasand/codex-auth/main
+  --from https://raw.githubusercontent.com/someone/codex-auth/main
+```
+
+```bash
+CODEX_AUTH_INSTALL_FROM=file:///path/to/codex-auth ./install.sh
 ```
 
 ## Usage
@@ -68,6 +118,7 @@ codex-auth current
 codex-auth save work
 codex-auth switch work
 codex-auth refresh-usage --all
+codex-auth --version
 ```
 
 Run `codex-auth help` for the full command reference.
@@ -80,7 +131,19 @@ The repo includes `completions/codex-auth.bash`, which enables tab completion fo
 - saved profile names read from `~/.codex/accounts/profiles`
 - `--all` for `refresh-usage`
 
+### Linux
+
 If your shell does not auto-load completions from the installed directory, add this to `~/.bashrc`:
+
+```bash
+source "$HOME/.local/share/bash-completion/completions/codex-auth"
+```
+
+If you want system-provided Bash completion auto-loading, install your distro's `bash-completion` package.
+
+### macOS
+
+Bash completion auto-loading typically requires Homebrew's `bash-completion@2` package. Even without it, you can still source the installed completion file manually:
 
 ```bash
 source "$HOME/.local/share/bash-completion/completions/codex-auth"
@@ -92,6 +155,11 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 - The active auth file remains `~/.codex/auth.json`
 - Usage refresh talks to ChatGPT Codex usage endpoints using the saved auth token
 - This project is intentionally small and practical; the code favors usefulness over ceremony
+
+## Smoke tests
+
+- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, and the `list` fallback when `column` is missing.
+- GitHub Actions runs that smoke test on Ubuntu and macOS for pushes and pull requests.
 
 ## License
 

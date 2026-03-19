@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+APP_VERSION="0.2.0"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -26,6 +27,7 @@ Commands:
   refresh-usage --all       Query live usage for all saved profiles
   rename <old> <new>        Rename a saved profile
   remove <name>             Delete a saved profile snapshot
+  version                   Show the codex-auth version
   help                      Show this help
 
 Environment:
@@ -33,6 +35,10 @@ Environment:
   CODEX_AUTH_USAGE_URL      Override usage endpoint URL for testing/custom routing
   CODEX_AUTH_SESSIONS_DIR   Override sessions directory for session snapshot parsing
 USAGE
+}
+
+print_version() {
+  printf '%s\n' "$APP_VERSION"
 }
 
 die() {
@@ -231,7 +237,7 @@ refresh_usage_python() {
   local include_session=${3:-0}
   local session_json=${4:-}
   local profile_name=${5:-}
-  python3 - "$auth_path" "$usage_path" "$DEFAULT_USAGE_URL" "$FALLBACK_USAGE_URL" "$include_session" "$session_json" "$profile_name" <<'PY'
+  python3 - "$auth_path" "$usage_path" "$DEFAULT_USAGE_URL" "$FALLBACK_USAGE_URL" "$include_session" "$session_json" "$profile_name" "$APP_VERSION" <<'PY'
 import datetime as dt
 import json
 import os
@@ -240,7 +246,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-auth_path, usage_path, default_url, fallback_url, include_session, session_json, profile_name = sys.argv[1:8]
+auth_path, usage_path, default_url, fallback_url, include_session, session_json, profile_name, app_version = sys.argv[1:9]
 obj = json.loads(Path(auth_path).read_text())
 tokens = obj.get('tokens') or {}
 access_token = tokens.get('access_token')
@@ -320,7 +326,7 @@ for url in urls:
             'Authorization': f'Bearer {access_token}',
             'ChatGPT-Account-Id': account_id,
             'Accept': 'application/json',
-            'User-Agent': 'codex-auth/2.0',
+            'User-Agent': f'codex-auth/{app_version}',
         },
     )
     try:
@@ -573,6 +579,34 @@ best_effort_refresh_usage() {
   refresh_usage_for_profile "$profile_name" >/dev/null 2>&1 || true
 }
 
+render_tsv_table() {
+  local table_file=$1
+  if command -v column >/dev/null 2>&1; then
+    column -t -s $'\t' "$table_file"
+    return 0
+  fi
+
+  python3 - "$table_file" <<'PY'
+import sys
+from pathlib import Path
+
+rows = [line.rstrip('\n').split('\t') for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()]
+if not rows:
+    raise SystemExit(0)
+widths = []
+for index in range(max(len(row) for row in rows)):
+    widths.append(max(len(row[index]) if index < len(row) else 0 for row in rows))
+for row in rows:
+    padded = []
+    for index, width in enumerate(widths):
+        value = row[index] if index < len(row) else ''
+        padded.append(value.ljust(width))
+    print('  '.join(padded).rstrip())
+PY
+
+  note "Tip: install 'column' for prettier table output."
+}
+
 save_profile() {
   local profile_name=$1
   validate_profile_name "$profile_name"
@@ -602,7 +636,7 @@ list_profiles() {
     profile_table_row_tsv "$name" "$active_name" >> "$table_file"
   done < <(list_profile_names)
   if [[ $names_found -eq 1 ]]; then
-    column -t -s $'\t' "$table_file"
+    render_tsv_table "$table_file"
   else
     note "No saved profiles in $PROFILES_DIR"
   fi
@@ -814,6 +848,11 @@ main() {
       shift
       [[ $# -eq 1 ]] || die "Usage: codex-auth remove <name>"
       remove_profile "$1"
+      ;;
+    version|-v|--version)
+      shift
+      [[ $# -eq 0 ]] || die "Usage: codex-auth version"
+      print_version
       ;;
     *)
       die "Unknown command '$cmd' (run 'codex-auth help')"
