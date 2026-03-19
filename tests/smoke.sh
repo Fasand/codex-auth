@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.2.2"
+EXPECTED_VERSION="0.3.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -47,11 +47,24 @@ test_install_help_mentions_dependency_flags() {
   assert_contains "$output" "--install-deps"
 }
 
+test_help_mentions_update_command() {
+  local output
+  output=$(bash "$ROOT_DIR/bin/codex-auth" help)
+  assert_contains "$output" "update"
+}
+
 test_readme_points_to_the_default_installer_command() {
   local readme
   readme=$(cat "$ROOT_DIR/README.md")
   assert_contains "$readme" "bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)"
   assert_contains "$readme" "See [CHANGELOG.md](CHANGELOG.md) for release history."
+}
+
+test_readme_lists_both_update_options() {
+  local readme
+  readme=$(cat "$ROOT_DIR/README.md")
+  assert_contains "$readme" "codex-auth update"
+  assert_contains "$readme" "bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)"
 }
 
 test_version_flag_reports_the_current_version() {
@@ -105,7 +118,7 @@ test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
   assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-03-19"
-  assert_contains "$changelog" "## 0.1.0 - 2026-03-19"
+  assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
 test_agents_md_captures_repo_workflow() {
@@ -114,6 +127,12 @@ test_agents_md_captures_repo_workflow() {
   assert_contains "$agents" 'Do not work directly on `main`.'
   assert_contains "$agents" 'Every PR should include a short self-test command'
   assert_contains "$agents" 'Maintain `CHANGELOG.md` newest-first.'
+}
+
+test_completion_lists_update_command() {
+  local completion
+  completion=$(cat "$ROOT_DIR/completions/codex-auth.bash")
+  assert_contains "$completion" "update"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -133,6 +152,15 @@ test_re_running_the_installer_updates_in_place() {
   PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
   PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
   [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after reinstall"
+}
+
+test_update_command_reuses_the_installer_without_cloning() {
+  local prefix stub_codex_dir
+  prefix=$(mktemp -d)
+  stub_codex_dir=$(make_stub_codex_dir)
+  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
+  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" "$prefix/bin/codex-auth" update >/dev/null
+  [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
 }
 
 test_list_works_without_column() {
@@ -157,17 +185,21 @@ JSON
 
 main() {
   test_install_help_mentions_dependency_flags
+  test_help_mentions_update_command
   test_readme_points_to_the_default_installer_command
+  test_readme_lists_both_update_options
   test_version_flag_reports_the_current_version
   test_dependency_check_reports_runtime_requirements
   test_dependency_check_uses_clear_red_green_status_markers
   test_remote_style_install_works_without_from_flag
   test_re_running_the_installer_updates_in_place
+  test_update_command_reuses_the_installer_without_cloning
   test_list_works_without_column
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
   test_changelog_tracks_the_current_release_newest_first
   test_agents_md_captures_repo_workflow
+  test_completion_lists_update_command
 }
 
 main "$@"

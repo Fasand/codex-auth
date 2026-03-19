@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.2.2`
+Current version: `0.3.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -14,6 +14,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Switch between saved profiles
 - List profiles with cached usage information
 - Refresh live usage data for one or all profiles
+- Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
 
 ## Prerequisites
@@ -85,7 +86,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/insta
 
 ## Update
 
-Re-run the same install command you used originally.
+You have two supported update options:
+
+1. Run the built-in updater:
+
+```bash
+codex-auth update
+```
+
+2. Re-run the install command directly:
 
 Examples:
 
@@ -102,6 +111,8 @@ Existing installations continue to update in place; you do not need to remove an
 ## Custom sources and forks
 
 By default, the installer downloads from this repository's `main` branch. If you are testing a fork or a different raw file base, override it with `--from` or `CODEX_AUTH_INSTALL_FROM`.
+
+`codex-auth update` also respects `CODEX_AUTH_INSTALL_FROM`, so advanced users can point self-update at an alternate raw base without cloning the repository.
 
 Examples:
 
@@ -122,6 +133,7 @@ codex-auth current
 codex-auth save work
 codex-auth switch work
 codex-auth refresh-usage --all
+codex-auth update
 codex-auth --version
 ```
 
@@ -131,7 +143,7 @@ Run `codex-auth help` for the full command reference.
 
 The repo includes `completions/codex-auth.bash`, which enables tab completion for:
 
-- top-level commands such as `list`, `switch`, and `refresh-usage`
+- top-level commands such as `list`, `switch`, `refresh-usage`, and `update`
 - saved profile names read from `~/.codex/accounts/profiles`
 - `--all` for `refresh-usage`
 

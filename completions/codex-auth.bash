@@ -16,7 +16,7 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage rename remove rm delete help"
+  local commands="list current save switch add refresh-usage update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
 
