@@ -18,8 +18,8 @@ Options:
 Examples:
   ./install.sh
   ./install.sh --prefix /usr/local
-  bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/codex-auth/main/install.sh) \
-    --from https://raw.githubusercontent.com/<owner>/codex-auth/main
+  bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
+    --from https://raw.githubusercontent.com/Fasand/codex-auth/main
 USAGE
 }
 

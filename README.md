@@ -41,8 +41,8 @@ You can change the destination with `--prefix`, `--bin-dir`, `--completion-dir`,
 Once this repository is published, you can install it directly from the raw files:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/codex-auth/main/install.sh) \
-  --from https://raw.githubusercontent.com/<owner>/codex-auth/main
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
+  --from https://raw.githubusercontent.com/Fasand/codex-auth/main
 ```
 
 ## Update
@@ -56,8 +56,8 @@ Examples:
 ```
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<owner>/codex-auth/main/install.sh) \
-  --from https://raw.githubusercontent.com/<owner>/codex-auth/main
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
+  --from https://raw.githubusercontent.com/Fasand/codex-auth/main
 ```
 
 ## Usage
