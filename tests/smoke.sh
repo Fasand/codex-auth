@@ -89,6 +89,15 @@ test_workflow_uses_node24_ready_checkout() {
   fi
 }
 
+test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
+  local script
+  script=$(cat "$ROOT_DIR/install.sh")
+  if [[ "$script" == *'array_contains "python3" "${missing_required_runtime[@]}"'* ]]; then
+    fail "expected install.sh to avoid direct empty-array expansion in dependency checks"
+  fi
+  assert_contains "$script" 'array_contains "python3" "missing_required_runtime"'
+}
+
 test_remote_style_install_works_without_from_flag() {
   local prefix stub_codex_dir output
   prefix=$(mktemp -d)
@@ -138,6 +147,7 @@ main() {
   test_re_running_the_installer_updates_in_place
   test_list_works_without_column
   test_workflow_uses_node24_ready_checkout
+  test_install_script_avoids_unsafe_array_expansion_in_dependency_report
 }
 
 main "$@"
