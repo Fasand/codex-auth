@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEFAULT_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
+
 usage() {
-  cat <<'USAGE'
+  cat <<USAGE
 Usage: install.sh [options]
 
-Install or update codex-auth from a local checkout or a raw file base URL.
+Install or update codex-auth from a local checkout or from:
+  $DEFAULT_FROM_BASE
 
 Options:
   --prefix <dir>            Install under this prefix (default: ~/.local)
   --bin-dir <dir>           Install the executable here
   --completion-dir <dir>    Install Bash completion here
   --from <base-url>         Download files from this raw base URL
+  --check-deps              Report dependency status and exit
+  --install-deps            Best-effort install supported dependencies
   --skip-completions        Install only the executable
+  --yes                     Assume yes for installer prompts
   -h, --help                Show this help
 
 Examples:
   ./install.sh
-  ./install.sh --prefix /usr/local
-  bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh) \
-    --from https://raw.githubusercontent.com/Fasand/codex-auth/main
+  ./install.sh --check-deps
+  ./install.sh --install-deps
+  bash <(curl -fsSL $DEFAULT_FROM_BASE/install.sh)
+  bash <(curl -fsSL $DEFAULT_FROM_BASE/install.sh) --install-deps
+  bash <(curl -fsSL $DEFAULT_FROM_BASE/install.sh) --from https://raw.githubusercontent.com/someone/codex-auth/main
 USAGE
 }
 
@@ -28,15 +36,168 @@ die() {
   exit 1
 }
 
+note() {
+  echo "$*" >&2
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+join_by() {
+  local sep=$1
+  shift || true
+  local out=""
+  local item
+  for item in "$@"; do
+    if [[ -n "$out" ]]; then
+      out+="$sep"
+    fi
+    out+="$item"
+  done
+  printf '%s\n' "$out"
+}
+
+append_unique() {
+  local array_name=$1
+  local value=$2
+  eval "local current=(\"\${${array_name}[@]:-}\")"
+  local item
+  for item in "${current[@]}"; do
+    [[ "$item" == "$value" ]] && return 0
+  done
+  eval "${array_name}+=(\"$value\")"
+}
+
+print_section() {
+  local title=$1
+  shift || true
+  echo "$title"
+  if [[ $# -eq 0 ]]; then
+    echo "  (none)"
+    return 0
+  fi
+  local item
+  for item in "$@"; do
+    echo "  - $item"
+  done
+}
+
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux) echo "linux" ;;
+    *) echo "other" ;;
+  esac
+}
+
+detect_package_manager() {
+  if have_cmd brew; then
+    echo "brew"
+  elif have_cmd apt-get; then
+    echo "apt-get"
+  elif have_cmd dnf; then
+    echo "dnf"
+  elif have_cmd pacman; then
+    echo "pacman"
+  else
+    echo ""
+  fi
+}
+
+bash_completion_available() {
+  local path
+  for path in \
+    /usr/share/bash-completion/bash_completion \
+    /etc/bash_completion \
+    /opt/homebrew/etc/profile.d/bash_completion.sh \
+    /usr/local/etc/profile.d/bash_completion.sh
+  do
+    [[ -f "$path" ]] && return 0
+  done
+  return 1
+}
+
+package_for_feature() {
+  local manager=$1
+  local feature=$2
+  case "$manager:$feature" in
+    apt-get:python3) echo "python3" ;;
+    apt-get:curl) echo "curl" ;;
+    apt-get:fzf) echo "fzf" ;;
+    apt-get:bash-completion) echo "bash-completion" ;;
+    dnf:python3) echo "python3" ;;
+    dnf:curl) echo "curl" ;;
+    dnf:fzf) echo "fzf" ;;
+    dnf:bash-completion) echo "bash-completion" ;;
+    pacman:python3) echo "python" ;;
+    pacman:curl) echo "curl" ;;
+    pacman:fzf) echo "fzf" ;;
+    pacman:bash-completion) echo "bash-completion" ;;
+    brew:python3) echo "python" ;;
+    brew:curl) echo "curl" ;;
+    brew:fzf) echo "fzf" ;;
+    brew:bash-completion) echo "bash-completion@2" ;;
+    *) return 1 ;;
+  esac
+}
+
+install_packages() {
+  local manager=$1
+  shift
+  [[ $# -gt 0 ]] || return 0
+
+  case "$manager" in
+    apt-get)
+      if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        apt-get update
+        apt-get install -y "$@"
+      elif have_cmd sudo; then
+        sudo apt-get update
+        sudo apt-get install -y "$@"
+      else
+        die "Need sudo or root privileges to install packages with apt-get"
+      fi
+      ;;
+    dnf)
+      if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        dnf install -y "$@"
+      elif have_cmd sudo; then
+        sudo dnf install -y "$@"
+      else
+        die "Need sudo or root privileges to install packages with dnf"
+      fi
+      ;;
+    pacman)
+      if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        pacman -Sy --noconfirm "$@"
+      elif have_cmd sudo; then
+        sudo pacman -Sy --noconfirm "$@"
+      else
+        die "Need sudo or root privileges to install packages with pacman"
+      fi
+      ;;
+    brew)
+      brew install "$@"
+      ;;
+    *)
+      die "Unsupported package manager: $manager"
+      ;;
+  esac
 }
 
 prefix="${PREFIX:-$HOME/.local}"
 bin_dir=""
 completion_dir=""
-from_base="${CODEX_AUTH_INSTALL_FROM:-}"
+from_base="${CODEX_AUTH_INSTALL_FROM:-$DEFAULT_FROM_BASE}"
 skip_completions=0
+check_deps_only=0
+install_deps=0
+auto_yes=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -60,8 +221,20 @@ while [[ $# -gt 0 ]]; do
       from_base=$2
       shift 2
       ;;
+    --check-deps)
+      check_deps_only=1
+      shift
+      ;;
+    --install-deps)
+      install_deps=1
+      shift
+      ;;
     --skip-completions)
       skip_completions=1
+      shift
+      ;;
+    --yes)
+      auto_yes=1
       shift
       ;;
     -h|--help)
@@ -78,10 +251,119 @@ bin_dir=${bin_dir:-$prefix/bin}
 completion_dir=${completion_dir:-$prefix/share/bash-completion/completions}
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 local_root=""
-
 if [[ -f "$script_dir/bin/codex-auth" && -f "$script_dir/completions/codex-auth.bash" ]]; then
   local_root=$script_dir
 fi
+remote_mode=1
+if [[ -n "$local_root" ]]; then
+  remote_mode=0
+fi
+
+os_name=$(detect_os)
+package_manager=$(detect_package_manager)
+
+declare -a missing_required_runtime=()
+declare -a missing_manual_prereqs=()
+declare -a missing_optional=()
+declare -a installable_features=()
+declare -a installable_packages=()
+
+collect_dependency_state() {
+  missing_required_runtime=()
+  missing_manual_prereqs=()
+  missing_optional=()
+  installable_features=()
+  installable_packages=()
+
+  if ! have_cmd python3; then
+    missing_required_runtime+=("python3")
+    append_unique installable_features "python3"
+  fi
+
+  if ! have_cmd codex; then
+    missing_manual_prereqs+=("codex CLI (manual prerequisite)")
+  fi
+
+  if [[ $remote_mode -eq 1 ]] && ! have_cmd curl; then
+    missing_required_runtime+=("curl (required for remote install/update)")
+    append_unique installable_features "curl"
+  fi
+
+  if ! have_cmd fzf; then
+    missing_optional+=("fzf (optional interactive picker)")
+    append_unique installable_features "fzf"
+  fi
+
+  if [[ $skip_completions -eq 0 ]] && ! bash_completion_available; then
+    missing_optional+=("bash-completion support (optional auto-loading for completions)")
+    append_unique installable_features "bash-completion"
+  fi
+
+  local feature package
+  if [[ -n "$package_manager" ]]; then
+    for feature in "${installable_features[@]}"; do
+      if package=$(package_for_feature "$package_manager" "$feature" 2>/dev/null); then
+        append_unique installable_packages "$package"
+      fi
+    done
+  fi
+}
+
+print_dependency_report() {
+  collect_dependency_state
+  echo "Dependency report"
+  echo "  OS: $os_name"
+  echo "  Package manager: ${package_manager:-not detected}"
+  echo "  Source mode: $([[ $remote_mode -eq 1 ]] && echo remote || echo local-checkout)"
+  echo
+  print_section "Required runtime" "bash (script runtime)" "python3" "codex CLI"
+  echo
+  print_section "Missing required runtime" "${missing_required_runtime[@]}"
+  echo
+  print_section "Missing manual prerequisites" "${missing_manual_prereqs[@]}"
+  echo
+  print_section "Optional extras that improve UX" "column (prettier tables; the tool will fall back without it)" "fzf (interactive picker)" "bash-completion support (auto-loading completions)"
+  echo
+  print_section "Missing optional extras" "${missing_optional[@]}"
+  echo
+  print_section "Installable now on this system" "${installable_packages[@]}"
+  if [[ ${#missing_required_runtime[@]} -gt 0 || ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+offer_or_install_dependencies() {
+  collect_dependency_state
+  [[ ${#installable_packages[@]} -gt 0 ]] || return 0
+
+  if [[ $install_deps -eq 1 ]]; then
+    note "Installing supported dependencies with ${package_manager:-unknown package manager}: $(join_by ', ' "${installable_packages[@]}")"
+    install_packages "$package_manager" "${installable_packages[@]}"
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 && $auto_yes -eq 1 ]]; then
+    install_deps=1
+    offer_or_install_dependencies
+    return 0
+  fi
+
+  if [[ -t 0 && -t 1 && -n "$package_manager" ]]; then
+    echo
+    echo "Missing supported dependencies detected: $(join_by ', ' "${installable_packages[@]}")"
+    read -r -p "Attempt to install them now with ${package_manager}? [y/N] " reply
+    case "$reply" in
+      y|Y|yes|YES)
+        install_deps=1
+        offer_or_install_dependencies
+        return 0
+        ;;
+    esac
+  fi
+
+  return 0
+}
 
 fetch_file() {
   local source_url=$1
@@ -89,6 +371,30 @@ fetch_file() {
   require_cmd curl
   curl -fsSL "$source_url" -o "$destination"
 }
+
+if [[ $check_deps_only -eq 1 ]]; then
+  if print_dependency_report; then
+    exit 0
+  else
+    exit 1
+  fi
+fi
+
+offer_or_install_dependencies
+collect_dependency_state
+
+if [[ ${#missing_required_runtime[@]} -gt 0 || ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+  echo
+  print_dependency_report || true
+  echo
+  if [[ ${#installable_packages[@]} -gt 0 && -n "$package_manager" ]]; then
+    echo "Re-run with --install-deps to install supported dependencies automatically."
+  fi
+  if [[ ${#missing_manual_prereqs[@]} -gt 0 ]]; then
+    echo "The Codex CLI remains a manual prerequisite and is not installed by this script."
+  fi
+  die "Cannot continue until the required prerequisites are available"
+fi
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
@@ -102,7 +408,6 @@ if [[ -n "$local_root" ]]; then
     cp "$local_root/completions/codex-auth.bash" "$completion_src"
   fi
 else
-  [[ -n "$from_base" ]] || die "Run this script from a codex-auth checkout, or provide --from <base-url>"
   from_base=${from_base%/}
   fetch_file "$from_base/bin/codex-auth" "$executable_src"
   if [[ $skip_completions -eq 0 ]]; then
@@ -112,7 +417,6 @@ fi
 
 mkdir -p "$bin_dir"
 install -m 0755 "$executable_src" "$bin_dir/codex-auth"
-
 echo "Installed codex-auth to $bin_dir/codex-auth"
 
 if [[ $skip_completions -eq 0 ]]; then
@@ -129,7 +433,13 @@ fi
 
 if [[ $skip_completions -eq 0 ]]; then
   echo
-  echo "If Bash completions do not load automatically, add this to ~/.bashrc:"
+  if bash_completion_available; then
+    echo "Bash completion support looks available on this system."
+    echo "If completions do not load automatically, add this to ~/.bashrc:"
+  else
+    echo "Bash completion support was not detected."
+    echo "You can still source the completion file manually by adding this to ~/.bashrc:"
+  fi
   echo "  source \"$completion_dir/codex-auth\""
 fi
 
