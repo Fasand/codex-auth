@@ -81,6 +81,12 @@ test_workflow_uses_node24_ready_checkout() {
   local workflow
   workflow=$(cat "$ROOT_DIR/.github/workflows/smoke.yml")
   assert_contains "$workflow" "actions/checkout@v6"
+  assert_contains "$workflow" "pull_request:"
+  assert_contains "$workflow" "branches:"
+  assert_contains "$workflow" "- main"
+  if [[ "$workflow" == *"feat/**"* || "$workflow" == *"fix/**"* || "$workflow" == *"chore/**"* ]]; then
+    fail "expected workflow to avoid duplicate branch-pattern push triggers"
+  fi
 }
 
 test_remote_style_install_works_without_from_flag() {
