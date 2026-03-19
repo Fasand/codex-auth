@@ -128,7 +128,13 @@ array_contains() {
   local array_name=$2
   local item
   local items=()
+  local count=0
   set +u
+  eval "count=\${#${array_name}[@]}"
+  if [[ "$count" -eq 0 ]]; then
+    set -u
+    return 1
+  fi
   eval "items=(\"\${${array_name}[@]}\")"
   set -u
   for item in "${items[@]}"; do

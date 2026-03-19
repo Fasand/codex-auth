@@ -96,6 +96,8 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
     fail "expected install.sh to avoid direct empty-array expansion in dependency checks"
   fi
   assert_contains "$script" 'array_contains "python3" "missing_required_runtime"'
+  assert_contains "$script" 'local count=0'
+  assert_contains "$script" 'eval "count=\${#${array_name}[@]}"'
 }
 
 test_remote_style_install_works_without_from_flag() {
