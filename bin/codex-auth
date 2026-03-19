@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.2.0"
+APP_VERSION="0.2.1"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
