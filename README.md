@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.3.0`
+Current version: `0.4.2`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -13,7 +13,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Save the current Codex auth snapshot as a named profile
 - Switch between saved profiles
 - List profiles with cached usage information
-- Refresh live usage data for one or all profiles
+- Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
 
@@ -35,7 +35,6 @@ The installer can check for and, on supported systems, best-effort install these
 
 Notes:
 
-- `column` is optional. If it is missing, `codex-auth list` falls back to a plain aligned table.
 - `install.sh --install-deps` currently supports Homebrew, `apt-get`, `dnf`, and `pacman`.
 - The installer does **not** install the `codex` CLI for you.
 
@@ -129,23 +128,38 @@ CODEX_AUTH_INSTALL_FROM=file:///path/to/codex-auth ./install.sh
 
 ```bash
 codex-auth list
+codex-auth list --utc
 codex-auth current
+codex-auth current --utc
 codex-auth save work
 codex-auth switch work
-codex-auth refresh-usage --all
+codex-auth refresh-usage
+codex-auth refresh work
 codex-auth update
 codex-auth --version
 ```
 
 Run `codex-auth help` for the full command reference.
 
+### Timezone display
+
+- `list`, `current`, `refresh-usage`, and `refresh` display reset/check timestamps in your local timezone by default.
+- Pass `--utc` to any of those commands if you want the older UTC-style output.
+- If a local timezone cannot be determined, the CLI falls back to UTC.
+
+### Refresh behavior
+
+- `codex-auth refresh-usage` or `codex-auth refresh` with no profile name asks for confirmation before refreshing every saved profile.
+- Multi-profile refreshes show progress as each profile is processed; interactive terminals use a single live-updating line, while non-interactive output stays line-based.
+- If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
+
 ## Bash completions
 
 The repo includes `completions/codex-auth.bash`, which enables tab completion for:
 
-- top-level commands such as `list`, `switch`, `refresh-usage`, and `update`
+- top-level commands such as `list`, `switch`, `refresh-usage`, `refresh`, and `update`
 - saved profile names read from `~/.codex/accounts/profiles`
-- `--all` for `refresh-usage`
+- `--all` and `--utc` for the relevant commands
 
 ### Linux
 
@@ -170,11 +184,12 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 - Profiles are stored under `~/.codex/accounts/profiles`
 - The active auth file remains `~/.codex/auth.json`
 - Usage refresh talks to ChatGPT Codex usage endpoints using the saved auth token
+- Terminal colors are enabled automatically on color-capable terminals and can be disabled with `NO_COLOR=1`
 - This project is intentionally small and practical; the code favors usefulness over ceremony
 
 ## Smoke tests
 
-- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, and the `list` fallback when `column` is missing.
+- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, timezone-aware list output, and refresh/list workflows.
 - GitHub Actions runs that smoke test on Ubuntu and macOS for pushes and pull requests.
 
 ## License

@@ -16,7 +16,7 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage update rename remove rm delete help"
+  local commands="list current save switch add refresh-usage refresh update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
 
@@ -25,9 +25,19 @@ _codex_auth_completion() {
       COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
       return 0
       ;;
-    refresh-usage)
-      COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+    list|current)
+      COMPREPLY=( $(compgen -W "--utc" -- "$cur") )
       return 0
+      ;;
+    refresh-usage|refresh)
+      COMPREPLY=( $(compgen -W "--all --utc $profiles" -- "$cur") )
+      return 0
+      ;;
+    --utc)
+      if [[ "$first" == "refresh-usage" || "$first" == "refresh" ]]; then
+        COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+        return 0
+      fi
       ;;
   esac
 

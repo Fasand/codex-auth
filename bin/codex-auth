@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.3.0"
+APP_VERSION="0.4.2"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -11,6 +11,15 @@ SESSIONS_DIR="${CODEX_AUTH_SESSIONS_DIR:-$CODEX_HOME/sessions}"
 DEFAULT_USAGE_URL="https://chatgpt.com/backend-api/codex/usage"
 FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_INSTALL_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
+export CODEX_AUTH_THEME_HEADER_STYLE="${CODEX_AUTH_THEME_HEADER_STYLE:-1}"
+export CODEX_AUTH_THEME_ACTIVE_STYLE="${CODEX_AUTH_THEME_ACTIVE_STYLE:-1;93}"
+export CODEX_AUTH_THEME_PROFILE_STYLE="${CODEX_AUTH_THEME_PROFILE_STYLE:-36}"
+export CODEX_AUTH_THEME_RESET_STYLE="${CODEX_AUTH_THEME_RESET_STYLE:-34}"
+export CODEX_AUTH_THEME_DIM_STYLE="${CODEX_AUTH_THEME_DIM_STYLE:-2}"
+export CODEX_AUTH_THEME_PLAN_STYLE="${CODEX_AUTH_THEME_PLAN_STYLE:-35}"
+export CODEX_AUTH_THEME_PERCENT_OK_STYLE="${CODEX_AUTH_THEME_PERCENT_OK_STYLE:-32}"
+export CODEX_AUTH_THEME_PERCENT_WARN_STYLE="${CODEX_AUTH_THEME_PERCENT_WARN_STYLE:-33}"
+export CODEX_AUTH_THEME_PERCENT_BAD_STYLE="${CODEX_AUTH_THEME_PERCENT_BAD_STYLE:-31}"
 
 usage() {
   cat <<USAGE
@@ -19,13 +28,15 @@ Usage: codex-auth <command> [args]
 Manage multiple ChatGPT Codex auth.json profiles.
 
 Commands:
-  list                      List saved profiles with account info and cached usage
-  current                   Show the currently active auth profile or current auth summary
+  list [--utc]              List saved profiles with account info and cached usage
+  current [--utc]           Show the currently active auth profile or current auth summary
   save <name>               Save the current auth.json as a named profile
   switch [name]             Switch to a saved profile (interactive if name omitted)
   add <name>                Run codex login, then save the result as <name>
-  refresh-usage <name>      Query live usage for one saved profile
-  refresh-usage --all       Query live usage for all saved profiles
+  refresh-usage [--utc] [<name>|--all]
+                            Query live usage for one profile or, with no args, confirm refresh for all profiles
+  refresh [--utc] [<name>|--all]
+                            Alias for refresh-usage
   update                    Update this installed codex-auth via install.sh
   rename <old> <new>        Rename a saved profile
   remove <name>             Delete a saved profile snapshot
@@ -59,6 +70,13 @@ have_cmd() {
 
 require_cmd() {
   have_cmd "$1" || die "Required command not found: $1"
+}
+
+color_output_enabled() {
+  [[ "${CODEX_AUTH_FORCE_COLOR:-0}" == "1" ]] && return 0
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+  [[ "${TERM:-}" == "dumb" ]] && return 1
+  [[ -t 1 ]]
 }
 
 ensure_dirs() {
@@ -398,130 +416,163 @@ raise SystemExit(last_error)
 PY
 }
 
-format_profile_line_json() {
+profile_display_payload_json() {
   local profile_name=$1
   local meta_path=$2
   local usage_path=$3
   local active_name=${4:-}
-  python3 - "$profile_name" "$meta_path" "$usage_path" "$active_name" <<'PY'
+  local use_utc=${5:-0}
+  python3 - "$profile_name" "$meta_path" "$usage_path" "$active_name" "$use_utc" <<'PY'
 import datetime as dt
 import json
 import sys
 from pathlib import Path
 
-profile_name, meta_path, usage_path, active_name = sys.argv[1:5]
+profile_name, meta_path, usage_path, active_name, use_utc = sys.argv[1:6]
 meta = json.loads(Path(meta_path).read_text()) if Path(meta_path).exists() else {}
 usage = json.loads(Path(usage_path).read_text()) if Path(usage_path).exists() else {}
 derived = usage.get('derived') or {}
 session = usage.get('session') or {}
 is_active = profile_name == active_name
+local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
 
 
-def human_window(value):
-    if not value:
+def first_value(*values):
+    for value in values:
+        if value not in (None, '', [], {}):
+            return value
+    return None
+
+
+def parse_datetime(value):
+    if value in (None, '', [], {}):
         return None
+    if isinstance(value, (int, float)):
+        return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return dt.datetime.fromtimestamp(int(text), tz=dt.timezone.utc)
+    normalized = text[:-1] + '+00:00' if text.endswith('Z') else text
     try:
-        value = int(value)
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def format_datetime(value):
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return ''
+    if use_utc == '1':
+        return parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
+    localized = parsed.astimezone(local_tz)
+    tz_name = localized.tzname() or 'UTC'
+    return localized.strftime('%d %b %H:%M ') + tz_name
+
+
+def format_percent(value):
+    if value in (None, ''):
+        return ''
+    try:
+        return f"{int(round(float(value)))}%"
     except Exception:
         return str(value)
-    if value >= 1000:
-        return f"{round(value/1000)}K"
-    return str(value)
 
 
-def add(parts, value):
-    if value not in (None, '', [], {}):
-        parts.append(str(value))
-
-def fmt_reset(epoch):
-    if epoch in (None, ''):
-        return None
-    try:
-        return dt.datetime.fromtimestamp(int(epoch), tz=dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
-    except Exception:
-        return str(epoch)
-
-parts = [f"{'*' if is_active else '-'} {profile_name}"]
-add(parts, meta.get('email') or 'unknown-email')
-add(parts, f"account={meta.get('accountId') or 'unknown-account'}")
-
-if is_active and session:
-    add(parts, f"{session.get('context_used_percent')}% used" if session.get('context_used_percent') is not None else None)
-    add(parts, f"{human_window(session.get('effective_context_window'))} window" if session.get('effective_context_window') else None)
-    add(parts, f"5h {derived.get('five_hour_remaining_percent')}%" if derived.get('five_hour_remaining_percent') is not None else (f"5h {session.get('five_hour_remaining_percent')}%" if session.get('five_hour_remaining_percent') is not None else None))
-    add(parts, f"5h reset {fmt_reset(derived.get('five_hour_reset_at'))}" if derived.get('five_hour_reset_at') is not None else (f"5h reset {fmt_reset(session.get('five_hour_reset_at'))}" if session.get('five_hour_reset_at') is not None else None))
-    add(parts, f"weekly {derived.get('weekly_remaining_percent')}%" if derived.get('weekly_remaining_percent') is not None else (f"weekly {session.get('weekly_remaining_percent')}%" if session.get('weekly_remaining_percent') is not None else None))
-    add(parts, f"weekly reset {fmt_reset(derived.get('weekly_reset_at'))}" if derived.get('weekly_reset_at') is not None else (f"weekly reset {fmt_reset(session.get('weekly_reset_at'))}" if session.get('weekly_reset_at') is not None else None))
-else:
-    add(parts, f"5h {derived.get('five_hour_remaining_percent')}%" if derived.get('five_hour_remaining_percent') is not None else None)
-    add(parts, f"5h reset {fmt_reset(derived.get('five_hour_reset_at'))}" if derived.get('five_hour_reset_at') is not None else None)
-    add(parts, f"weekly {derived.get('weekly_remaining_percent')}%" if derived.get('weekly_remaining_percent') is not None else None)
-    add(parts, f"weekly reset {fmt_reset(derived.get('weekly_reset_at'))}" if derived.get('weekly_reset_at') is not None else None)
-
-add(parts, f"plan={usage.get('plan_type') or session.get('plan_type')}" if (usage.get('plan_type') or session.get('plan_type')) else None)
-add(parts, f"checked={usage.get('fetchedAt')}" if usage.get('fetchedAt') else None)
-print(' | '.join(parts))
+payload = {
+    'active': is_active,
+    'profile': profile_name,
+    'email': meta.get('email') or '',
+    'account': meta.get('accountId') or '',
+    'plan': first_value(usage.get('plan_type'), session.get('plan_type')) or '',
+    'five_hour': format_percent(first_value(derived.get('five_hour_remaining_percent'), session.get('five_hour_remaining_percent'))),
+    'five_hour_reset': format_datetime(first_value(derived.get('five_hour_reset_at'), session.get('five_hour_reset_at'))),
+    'weekly': format_percent(first_value(derived.get('weekly_remaining_percent'), session.get('weekly_remaining_percent'))),
+    'weekly_reset': format_datetime(first_value(derived.get('weekly_reset_at'), session.get('weekly_reset_at'))),
+    'checked': format_datetime(usage.get('fetchedAt')),
+    'token_expires': format_datetime(meta.get('tokenExpiresAt')),
+    'last_refresh': format_datetime(meta.get('lastRefresh')),
+}
+print(json.dumps(payload))
 PY
 }
 
 render_profile_line() {
   local profile_name=$1
   local active_name=${2:-}
-  format_profile_line_json "$profile_name" "$(profile_meta_path "$profile_name")" "$(profile_usage_path "$profile_name")" "$active_name"
-}
-
-profile_table_row_tsv() {
-  local profile_name=$1
-  local active_name=${2:-}
+  local use_utc=${3:-0}
   local meta_path usage_path
+  local payload_json
   meta_path=$(profile_meta_path "$profile_name")
   usage_path=$(profile_usage_path "$profile_name")
-  python3 - "$profile_name" "$meta_path" "$usage_path" "$active_name" <<'PY'
-import datetime as dt
+  payload_json=$(profile_display_payload_json "$profile_name" "$meta_path" "$usage_path" "$active_name" "$use_utc")
+  python3 - "$payload_json" <<'PY'
 import json
+import os
+import re
 import sys
-from pathlib import Path
 
-profile_name, meta_path, usage_path, active_name = sys.argv[1:5]
-meta = json.loads(Path(meta_path).read_text()) if Path(meta_path).exists() else {}
-usage = json.loads(Path(usage_path).read_text()) if Path(usage_path).exists() else {}
-derived = usage.get('derived') or {}
-session = usage.get('session') or {}
-is_active = profile_name == active_name
+payload = json.loads(sys.argv[1])
 
-def human_window(value):
-    if value in (None, ''):
-        return ''
-    try:
-        value = int(value)
-    except Exception:
-        return str(value)
-    if value >= 1000:
-        return f"{round(value/1000)}K"
-    return str(value)
 
-def fmt_reset(epoch):
-    if epoch in (None, ''):
-        return ''
-    try:
-        return dt.datetime.fromtimestamp(int(epoch), tz=dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
-    except Exception:
-        return str(epoch)
+def use_color():
+    if os.environ.get('CODEX_AUTH_FORCE_COLOR') == '1':
+        return True
+    if os.environ.get('NO_COLOR'):
+        return False
+    if os.environ.get('TERM') == 'dumb':
+        return False
+    return sys.stdout.isatty()
 
-row = [
-    '*' if is_active else '',
-    profile_name,
-    meta.get('email') or '',
-    usage.get('plan_type') or session.get('plan_type') or '',
-    f"{session.get('context_used_percent')}% used" if is_active and session.get('context_used_percent') is not None else '',
-    human_window(session.get('effective_context_window')) if is_active else '',
-    f"{derived.get('five_hour_remaining_percent')}%" if derived.get('five_hour_remaining_percent') is not None else '',
-    fmt_reset(derived.get('five_hour_reset_at')),
-    f"{derived.get('weekly_remaining_percent')}%" if derived.get('weekly_remaining_percent') is not None else '',
-    fmt_reset(derived.get('weekly_reset_at')),
-    usage.get('fetchedAt') or '',
-]
-print('\t'.join(row))
+
+def paint(text, style_name):
+    if not text:
+        return text
+    if not use_color():
+        return text
+    style = os.environ.get(style_name, '')
+    return f"\033[{style}m{text}\033[0m" if style else text
+
+
+def percent_style(value):
+    match = re.search(r'(\d+)', value or '')
+    if not match:
+        return value
+    amount = int(match.group(1))
+    if amount >= 67:
+        return paint(value, 'CODEX_AUTH_THEME_PERCENT_OK_STYLE')
+    if amount >= 34:
+        return paint(value, 'CODEX_AUTH_THEME_PERCENT_WARN_STYLE')
+    return paint(value, 'CODEX_AUTH_THEME_PERCENT_BAD_STYLE')
+
+
+parts = []
+marker = paint('*', 'CODEX_AUTH_THEME_ACTIVE_STYLE') if payload.get('active') else '-'
+parts.append(f"{marker} {paint(payload.get('profile') or 'unknown-profile', 'CODEX_AUTH_THEME_PROFILE_STYLE')}")
+if payload.get('email'):
+    parts.append(payload['email'])
+if payload.get('account'):
+    parts.append(f"account={payload['account']}")
+if payload.get('plan'):
+    parts.append(f"plan={paint(payload['plan'], 'CODEX_AUTH_THEME_PLAN_STYLE')}")
+if payload.get('five_hour'):
+    segment = f"5h {percent_style(payload['five_hour'])}"
+    if payload.get('five_hour_reset'):
+        segment += f" (resets {paint(payload['five_hour_reset'], 'CODEX_AUTH_THEME_RESET_STYLE')})"
+    parts.append(segment)
+if payload.get('weekly'):
+    segment = f"weekly {percent_style(payload['weekly'])}"
+    if payload.get('weekly_reset'):
+        segment += f" (resets {paint(payload['weekly_reset'], 'CODEX_AUTH_THEME_RESET_STYLE')})"
+    parts.append(segment)
+if payload.get('checked'):
+    parts.append(f"checked={paint(payload['checked'], 'CODEX_AUTH_THEME_DIM_STYLE')}")
+print(' | '.join(parts))
 PY
 }
 
@@ -572,7 +623,7 @@ PY
 refresh_usage_for_profile() {
   local profile_name=$1
   validate_profile_name "$profile_name"
-  local dir auth_path usage_path include_session=0 session_json=""
+  local dir auth_path usage_path include_session=0 session_json="" error_file output status
   dir=$(profile_dir "$profile_name")
   [[ -d "$dir" ]] || die "Unknown profile '$profile_name'"
   auth_path=$(profile_auth_path "$profile_name")
@@ -582,7 +633,18 @@ refresh_usage_for_profile() {
       include_session=1
     fi
   fi
-  refresh_usage_python "$auth_path" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null
+  error_file=$(mktemp)
+  if refresh_usage_python "$auth_path" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null 2>"$error_file"; then
+    rm -f "$error_file"
+    return 0
+  else
+    status=$?
+  fi
+  output=$(cat "$error_file")
+  rm -f "$error_file"
+  output=${output//$'\n'/ }
+  printf '%s\n' "$output"
+  return "$status"
 }
 
 best_effort_refresh_usage() {
@@ -590,32 +652,188 @@ best_effort_refresh_usage() {
   refresh_usage_for_profile "$profile_name" >/dev/null 2>&1 || true
 }
 
-render_tsv_table() {
-  local table_file=$1
-  if command -v column >/dev/null 2>&1; then
-    column -t -s $'\t' "$table_file"
+refresh_progress_bar() {
+  local completed=$1
+  local total=$2
+  local width=${3:-12}
+  local filled=0 empty=0 i
+  (( total > 0 )) || total=1
+  (( completed < 0 )) && completed=0
+  (( completed > total )) && completed=$total
+  filled=$(( completed * width / total ))
+  empty=$(( width - filled ))
+  printf '['
+  for ((i = 0; i < filled; i++)); do
+    printf '#'
+  done
+  for ((i = 0; i < empty; i++)); do
+    printf '.'
+  done
+  printf ']'
+}
+
+refresh_progress_begin() {
+  local index=$1
+  local total=$2
+  local profile_name=$3
+  if [[ -t 2 ]]; then
+    printf '\rRefreshing %d/%d %s %s...\033[K' "$index" "$total" "$(refresh_progress_bar "$((index - 1))" "$total")" "$profile_name" >&2
+  else
+    printf 'Refreshing %d/%d: %s... ' "$index" "$total" "$profile_name" >&2
+  fi
+}
+
+refresh_progress_finish() {
+  local index=$1
+  local total=$2
+  local profile_name=$3
+  local outcome=$4
+  local detail=${5:-}
+  if [[ -t 2 ]]; then
+    if [[ "$outcome" == "ok" ]]; then
+      printf '\rRefreshed  %d/%d %s %s\033[K' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+    else
+      printf '\rFailed     %d/%d %s %s — see summary below\033[K' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+    fi
     return 0
   fi
 
-  python3 - "$table_file" <<'PY'
+  if [[ "$outcome" == "ok" ]]; then
+    note "Refreshed $profile_name"
+  else
+    note "Failed $profile_name: $detail"
+  fi
+}
+
+refresh_progress_clear() {
+  [[ -t 2 ]] || return 0
+  printf '\r\033[K' >&2
+}
+
+collect_refresh_targets() {
+  local target=${1:-}
+  local name
+  if [[ "$target" == "--all" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      printf '%s\n' "$name"
+    done < <(list_profile_names)
+    return 0
+  fi
+
+  validate_profile_name "$target"
+  [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+  printf '%s\n' "$target"
+}
+
+render_profile_table() {
+  local payload_file=$1
+  local color_enabled=0
+  if color_output_enabled; then
+    color_enabled=1
+  fi
+
+  python3 - "$payload_file" "$color_enabled" <<'PY'
+import json
+import os
+import re
 import sys
 from pathlib import Path
 
-rows = [line.rstrip('\n').split('\t') for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()]
+rows = []
+for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    line = line.strip()
+    if line:
+        rows.append(json.loads(line))
+
 if not rows:
     raise SystemExit(0)
-widths = []
-for index in range(max(len(row) for row in rows)):
-    widths.append(max(len(row[index]) if index < len(row) else 0 for row in rows))
-for row in rows:
-    padded = []
-    for index, width in enumerate(widths):
-        value = row[index] if index < len(row) else ''
-        padded.append(value.ljust(width))
-    print('  '.join(padded).rstrip())
-PY
 
-  note "Tip: install 'column' for prettier table output."
+color_enabled = sys.argv[2] == '1'
+
+
+def paint(text, style_name):
+    if not text or not color_enabled:
+        return text
+    style = os.environ.get(style_name, '')
+    return f"\033[{style}m{text}\033[0m" if style else text
+
+
+def percent_style(value):
+    match = re.search(r'(\d+)', value or '')
+    if not match:
+        return value
+    amount = int(match.group(1))
+    if amount >= 67:
+        return paint(value, 'CODEX_AUTH_THEME_PERCENT_OK_STYLE')
+    if amount >= 34:
+        return paint(value, 'CODEX_AUTH_THEME_PERCENT_WARN_STYLE')
+    return paint(value, 'CODEX_AUTH_THEME_PERCENT_BAD_STYLE')
+
+
+def profile_cell(row):
+    marker = paint('*', 'CODEX_AUTH_THEME_ACTIVE_STYLE') if row.get('active') else ' '
+    profile = paint(row.get('profile') or '', 'CODEX_AUTH_THEME_PROFILE_STYLE')
+    return f"{marker} {profile}"
+
+
+profile_plain_cells = [("* " if row.get('active') else "  ") + (row.get('profile') or '') for row in rows]
+headers = ['PROFILE', 'EMAIL', 'PLAN', '5H', 'RESET', 'WEEKLY', 'RESET', 'CHECKED']
+columns = [
+    profile_plain_cells,
+    [row.get('email') or '' for row in rows],
+    [row.get('plan') or '' for row in rows],
+    [row.get('five_hour') or '' for row in rows],
+    [row.get('five_hour_reset') or '' for row in rows],
+    [row.get('weekly') or '' for row in rows],
+    [row.get('weekly_reset') or '' for row in rows],
+    [row.get('checked') or '' for row in rows],
+]
+widths = []
+for header, values in zip(headers, columns):
+    widths.append(max([len(header)] + [len(value) for value in values]))
+
+
+def pad(value, width):
+    return (value or '').ljust(width)
+
+
+def render_row(index, header=False):
+    row = rows[index] if not header else None
+    values = [
+        headers[0] if header else pad(profile_plain_cells[index], widths[0]),
+        headers[1] if header else pad(row.get('email') or '', widths[1]),
+        headers[2] if header else pad(row.get('plan') or '', widths[2]),
+        headers[3] if header else pad(row.get('five_hour') or '', widths[3]),
+        headers[4] if header else pad(row.get('five_hour_reset') or '', widths[4]),
+        headers[5] if header else pad(row.get('weekly') or '', widths[5]),
+        headers[6] if header else pad(row.get('weekly_reset') or '', widths[6]),
+        headers[7] if header else pad(row.get('checked') or '', widths[7]),
+    ]
+    if header:
+        values = [pad(value, width) for value, width in zip(values, widths)]
+        values = [paint(value, 'CODEX_AUTH_THEME_HEADER_STYLE') for value in values]
+    else:
+        values[0] = profile_cell(row) + (' ' * max(0, widths[0] - len(profile_plain_cells[index])))
+        if row.get('plan'):
+            values[2] = paint(pad(row.get('plan') or '', widths[2]), 'CODEX_AUTH_THEME_PLAN_STYLE')
+        if row.get('five_hour'):
+            values[3] = percent_style(pad(row.get('five_hour') or '', widths[3]))
+        if row.get('five_hour_reset'):
+            values[4] = paint(pad(row.get('five_hour_reset') or '', widths[4]), 'CODEX_AUTH_THEME_RESET_STYLE')
+        if row.get('weekly'):
+            values[5] = percent_style(pad(row.get('weekly') or '', widths[5]))
+        if row.get('weekly_reset'):
+            values[6] = paint(pad(row.get('weekly_reset') or '', widths[6]), 'CODEX_AUTH_THEME_RESET_STYLE')
+        if row.get('checked'):
+            values[7] = paint(pad(row.get('checked') or '', widths[7]), 'CODEX_AUTH_THEME_DIM_STYLE')
+    return f"{values[0]}  {values[1]}  {values[2]} | {values[3]}  {values[4]} | {values[5]}  {values[6]} | {values[7]}".rstrip()
+
+
+print(render_row(0, header=True))
+for index in range(len(rows)):
+    print(render_row(index))
+PY
 }
 
 save_profile() {
@@ -637,46 +855,71 @@ save_profile() {
 
 list_profiles() {
   ensure_dirs
-  local active_name names_found=0 name table_file
+  local use_utc=${1:-0}
+  local active_name names_found=0 name payload_file
   active_name=$(find_matching_profile || true)
-  table_file=$(mktemp)
-  printf 'ACTIVE\tPROFILE\tEMAIL\tPLAN\tCONTEXT\tWINDOW\t5H\t5H_RESET\tWEEKLY\tWEEKLY_RESET\tCHECKED\n' > "$table_file"
+  payload_file=$(mktemp)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     names_found=1
-    profile_table_row_tsv "$name" "$active_name" >> "$table_file"
+    profile_display_payload_json "$name" "$(profile_meta_path "$name")" "$(profile_usage_path "$name")" "$active_name" "$use_utc" >> "$payload_file"
   done < <(list_profile_names)
   if [[ $names_found -eq 1 ]]; then
-    render_tsv_table "$table_file"
+    render_profile_table "$payload_file"
   else
     note "No saved profiles in $PROFILES_DIR"
   fi
-  rm -f "$table_file"
+  rm -f "$payload_file"
 }
 
 show_current() {
   ensure_dirs
   require_auth_file
+  local use_utc=${1:-0}
   local matched
   matched=$(find_matching_profile || true)
   if [[ -n "$matched" ]]; then
-    render_profile_line "$matched" "$matched"
+    render_profile_line "$matched" "$matched" "$use_utc"
     return 0
   fi
 
   local tmp_meta
   tmp_meta=$(mktemp)
   extract_meta_json "untracked" "$AUTH_FILE" > "$tmp_meta"
-  python3 - "$tmp_meta" <<'PY'
-import json, sys
+  python3 - "$tmp_meta" "$use_utc" <<'PY'
+import datetime as dt
+import json
+import sys
+
 meta = json.load(open(sys.argv[1]))
+use_utc = sys.argv[2] == '1'
+local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+
+
+def format_datetime(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if use_utc:
+        return parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
+    localized = parsed.astimezone(local_tz)
+    return localized.strftime('%d %b %H:%M ') + (localized.tzname() or 'UTC')
+
 parts = ['* untracked']
 parts.append(meta.get('email') or 'unknown-email')
 parts.append(f"account={meta.get('accountId') or 'unknown-account'}")
 if meta.get('tokenExpiresAt'):
-    parts.append(f"expires={meta['tokenExpiresAt']}")
+    parts.append(f"expires={format_datetime(meta['tokenExpiresAt'])}")
 if meta.get('lastRefresh'):
-    parts.append(f"last_refresh={meta['lastRefresh']}")
+    parts.append(f"last_refresh={format_datetime(meta['lastRefresh'])}")
 print(' | '.join(parts))
 PY
   rm -f "$tmp_meta"
@@ -797,23 +1040,89 @@ remove_profile() {
   note "Removed '$profile_name'"
 }
 
+refresh_cancel_instruction() {
+  note "Use 'codex-auth refresh-usage <profile>' for one profile or 'codex-auth refresh-usage --all' to skip the prompt."
+}
+
+confirm_refresh_all_profiles() {
+  local reply
+  local read_status=0
+  printf 'Do you want to refresh usage for all profiles? [Y/n] ' >&2
+  read -r reply || read_status=$?
+  if [[ $read_status -ne 0 ]]; then
+    [[ $read_status -eq 130 ]] && return 130
+    note "Refresh cancelled."
+    refresh_cancel_instruction
+    return 1
+  fi
+  case "$reply" in
+    ""|y|Y|yes|YES|Yes)
+      return 0
+      ;;
+    n|N|no|NO|No)
+      note "Refresh cancelled."
+      refresh_cancel_instruction
+      return 1
+      ;;
+    *)
+      note "Refresh cancelled."
+      refresh_cancel_instruction
+      return 1
+      ;;
+  esac
+}
+
 refresh_usage_command() {
   ensure_dirs
   local target=${1:-}
-  if [[ "$target" == "--all" ]]; then
-    local any=0 name
-    while IFS= read -r name; do
-      [[ -n "$name" ]] || continue
-      any=1
-      refresh_usage_for_profile "$name"
-      echo "refreshed $name"
-    done < <(list_profile_names)
-    [[ $any -eq 1 ]] || die "No saved profiles to refresh"
-    return 0
+  local use_utc=${2:-0}
+  local confirm_status=0
+  local name error
+  local index=0 total=0 failure_count=0
+  local -a targets=() failure_names=() failure_errors=()
+  if [[ -z "$target" ]]; then
+    confirm_refresh_all_profiles || confirm_status=$?
+    [[ $confirm_status -eq 0 ]] || return "$confirm_status"
+    target="--all"
   fi
-  [[ -n "$target" ]] || die "Usage: codex-auth refresh-usage <name>|--all"
-  refresh_usage_for_profile "$target"
-  render_profile_line "$target" "$(find_matching_profile || true)"
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    targets+=("$name")
+  done < <(collect_refresh_targets "$target")
+
+  total=${#targets[@]}
+  (( total > 0 )) || die "No saved profiles to refresh"
+
+  for name in "${targets[@]}"; do
+    index=$((index + 1))
+    refresh_progress_begin "$index" "$total" "$name"
+    error=""
+    if error=$(refresh_usage_for_profile "$name"); then
+      refresh_progress_finish "$index" "$total" "$name" "ok"
+      continue
+    fi
+    failure_names+=("$name")
+    failure_errors+=("$error")
+    failure_count=$((failure_count + 1))
+    refresh_progress_finish "$index" "$total" "$name" "fail" "$error"
+  done
+
+  refresh_progress_clear
+  list_profiles "$use_utc"
+
+  if (( failure_count > 0 )); then
+    if (( failure_count == 1 )); then
+      note "1 profile failed to refresh:"
+    else
+      note "$failure_count profiles failed to refresh:"
+    fi
+    for index in "${!failure_names[@]}"; do
+      note "- ${failure_names[index]}: ${failure_errors[index]}"
+    done
+    return 1
+  fi
+  return 0
 }
 
 resolve_current_executable_path() {
@@ -892,11 +1201,33 @@ main() {
       ;;
     list)
       shift
-      list_profiles
+      case "${1:-}" in
+        "")
+          list_profiles 0
+          ;;
+        --utc)
+          [[ $# -eq 1 ]] || die "Usage: codex-auth list [--utc]"
+          list_profiles 1
+          ;;
+        *)
+          die "Usage: codex-auth list [--utc]"
+          ;;
+      esac
       ;;
     current)
       shift
-      show_current
+      case "${1:-}" in
+        "")
+          show_current 0
+          ;;
+        --utc)
+          [[ $# -eq 1 ]] || die "Usage: codex-auth current [--utc]"
+          show_current 1
+          ;;
+        *)
+          die "Usage: codex-auth current [--utc]"
+          ;;
+      esac
       ;;
     save)
       shift
@@ -913,10 +1244,31 @@ main() {
       [[ $# -eq 1 ]] || die "Usage: codex-auth add <name>"
       add_profile "$1"
       ;;
-    refresh-usage)
+    refresh-usage|refresh)
       shift
-      [[ $# -eq 1 ]] || die "Usage: codex-auth refresh-usage <name>|--all"
-      refresh_usage_command "$1"
+      local refresh_target=""
+      local refresh_use_utc=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --utc)
+            [[ $refresh_use_utc -eq 0 ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            refresh_use_utc=1
+            ;;
+          --all)
+            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            refresh_target="--all"
+            ;;
+          -*)
+            die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            ;;
+          *)
+            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            refresh_target="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_usage_command "$refresh_target" "$refresh_use_utc"
       ;;
     update)
       shift

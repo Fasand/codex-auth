@@ -2,6 +2,23 @@
 
 Newest releases go at the top.
 
+## 0.4.2 - 2026-03-26
+
+- Changed interactive refresh progress to use a single live-updating terminal line instead of leaving one progress-bar line per profile.
+- Kept non-interactive refresh output simple and line-based, without progress bars, so logs and captured output stay readable.
+
+## 0.4.1 - 2026-03-26
+
+- Added visible refresh progress output so multi-profile usage refreshes show which profile is currently being processed and how far through the batch they are.
+- Changed refresh-all flows to continue past per-profile failures, then summarize every failed profile at the end instead of stopping at the first expired token.
+- Kept the automatic post-refresh profile list while returning a non-zero exit status when any profile refresh fails.
+
+## 0.4.0 - 2026-03-26
+
+- Switched profile date/time displays to the current local timezone by default and added `--utc` for `list`, `current`, `refresh-usage`, and `refresh`.
+- Redesigned the profile table to focus on plan, 5-hour, and weekly limits, with clearer grouped separators, tighter active markers, and optional terminal colors for headers, profiles, resets, and limit percentages.
+- Made bare `refresh-usage` / `refresh` confirm an all-profile refresh, then automatically print the updated profile list.
+
 ## 0.3.0 - 2026-03-19
 
 - Added a new `codex-auth update` command that self-updates via the existing installer without cloning the repository.
