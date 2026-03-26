@@ -397,11 +397,6 @@ print_dependency_report() {
   fi
 
   echo "Optional"
-  if have_cmd column; then
-    print_status_line "ok" "column" "prettier tables"
-  else
-    print_status_line "missing" "column" "plain aligned table fallback is built in"
-  fi
   if array_contains "fzf (optional interactive picker)" "missing_optional"; then
     print_status_line "missing" "fzf" "interactive picker"
   else

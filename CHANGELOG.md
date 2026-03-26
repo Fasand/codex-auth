@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.4.0 - 2026-03-26
+
+- Switched profile date/time displays to the current local timezone by default and added `--utc` for `list`, `current`, `refresh-usage`, and `refresh`.
+- Redesigned the profile table to focus on plan, 5-hour, and weekly limits, with clearer grouped separators, tighter active markers, and optional terminal colors for headers, profiles, resets, and limit percentages.
+- Made bare `refresh-usage` / `refresh` confirm an all-profile refresh, then automatically print the updated profile list.
+
 ## 0.3.0 - 2026-03-19
 
 - Added a new `codex-auth update` command that self-updates via the existing installer without cloning the repository.
