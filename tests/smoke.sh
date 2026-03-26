@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.4.2"
+EXPECTED_VERSION="0.4.3"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -194,6 +194,14 @@ test_readme_lists_both_update_options() {
   assert_contains "$readme" "bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/install.sh)"
 }
 
+test_readme_documents_installing_a_specific_tagged_version() {
+  local readme
+  readme=$(cat "$ROOT_DIR/README.md")
+  assert_contains "$readme" "Install a specific tagged version"
+  assert_contains "$readme" "https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0/install.sh"
+  assert_contains "$readme" "--from https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0"
+}
+
 test_version_flag_reports_the_current_version() {
   local output
   output=$(bash "$ROOT_DIR/bin/codex-auth" --version)
@@ -254,6 +262,8 @@ test_agents_md_captures_repo_workflow() {
   assert_contains "$agents" 'Do not work directly on `main`.'
   assert_contains "$agents" 'Every PR should include a short self-test command'
   assert_contains "$agents" 'Maintain `CHANGELOG.md` newest-first.'
+  assert_contains "$agents" 'For each `0.x` minor line, keep tags for `0.x.0` and the latest `0.x.y` release in that line.'
+  assert_contains "$agents" 'If a newer patch release becomes the latest in a `0.x` line, delete the superseded latest patch tag and create the new latest patch tag for that line.'
 }
 
 test_completion_lists_update_command() {
@@ -414,6 +424,7 @@ main() {
   test_help_mentions_refresh_alias_and_utc_flag
   test_readme_points_to_the_default_installer_command
   test_readme_lists_both_update_options
+  test_readme_documents_installing_a_specific_tagged_version
   test_version_flag_reports_the_current_version
   test_dependency_check_reports_runtime_requirements
   test_dependency_check_uses_clear_red_green_status_markers

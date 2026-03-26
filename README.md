@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.4.2`
+Current version: `0.4.3`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -106,6 +106,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/insta
 ```
 
 Existing installations continue to update in place; you do not need to remove anything first.
+
+## Install a specific tagged version
+
+The repository keeps retained release tags so you can install specific historical versions when needed. Use the same raw GitHub pattern, but replace `main` with a tag such as `0.3.0`:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0/install.sh) \
+  --from https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0
+```
+
+You can also install any other retained tag the same way:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/<tag>/install.sh) \
+  --from https://raw.githubusercontent.com/Fasand/codex-auth/<tag>
+```
+
+For older `0.x` release lines, the repo keeps the `0.x.0` tag and the latest patch tag from that line.
 
 ## Custom sources and forks
 

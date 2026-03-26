@@ -21,6 +21,13 @@ Small CLI for saving, switching, listing, and refreshing multiple ChatGPT Codex 
 - Minor (`0.x.0`) for new user-visible features or notable behavior changes.
 - Update version references consistently in `VERSION`, `bin/codex-auth`, README, changelog, and any tests that pin the current version.
 
+## Release tags
+
+- For each `0.x` minor line, keep tags for `0.x.0` and the latest `0.x.y` release in that line.
+- If a newer patch release becomes the latest in a `0.x` line, delete the superseded latest patch tag and create the new latest patch tag for that line.
+- Use plain version tag names such as `0.3.0`, not `v0.3.0`.
+- Keep README guidance current for installing from a specific retained tag.
+
 ## Changelog
 
 - Maintain `CHANGELOG.md` newest-first.

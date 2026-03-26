@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.4.3 - 2026-03-26
+
+- Documented the retained-tag release policy in `AGENTS.md` so future releases keep `0.x.0` and the latest `0.x.y` tag for each minor line.
+- Added README guidance for installing a specific retained tagged version such as `0.3.0`.
+- Added smoke coverage for the new tag-install documentation and tagging-policy workflow notes.
+
 ## 0.4.2 - 2026-03-26
 
 - Changed interactive refresh progress to use a single live-updating terminal line instead of leaving one progress-bar line per profile.
