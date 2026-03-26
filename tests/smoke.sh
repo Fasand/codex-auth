@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.4.0"
+EXPECTED_VERSION="0.4.1"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -85,16 +85,35 @@ JSON
 
 start_mock_usage_server() {
   local port_file=$1
-  python3 -u - "$port_file" >/dev/null 2>&1 <<'PY' &
+  local fail_tokens=${2:-}
+  python3 -u - "$port_file" "$fail_tokens" >/dev/null 2>&1 <<'PY' &
 import http.server
 import json
 import socketserver
 import sys
 
 port_file = sys.argv[1]
+fail_tokens = {token for token in sys.argv[2].split(',') if token}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        auth = self.headers.get("Authorization", "")
+        token = auth.removeprefix("Bearer ").strip()
+        if token in fail_tokens:
+            body = {
+                "status": 401,
+                "error": {
+                    "code": "token_expired",
+                    "message": f"token expired for {token}",
+                },
+            }
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         body = {
             "plan_type": "plus",
             "rate_limit": {
@@ -324,6 +343,10 @@ test_refresh_without_args_prompts_and_lists_all_profiles() {
 
   output=$(printf '\n' | TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-usage 2>&1)
   assert_contains "$output" "Do you want to refresh usage for all profiles?"
+  assert_contains "$output" "Refreshing 1/2: alpha..."
+  assert_contains "$output" "Refreshing 2/2: beta..."
+  assert_contains "$output" "Refreshed alpha"
+  assert_contains "$output" "Refreshed beta"
   assert_contains "$output" "alpha"
   assert_contains "$output" "beta"
   assert_contains "$output" "84%"
@@ -346,6 +369,43 @@ test_refresh_cancel_shows_usage_instruction() {
   assert_contains "$output" "Use 'codex-auth refresh-usage <profile>' for one profile"
 }
 
+test_refresh_continues_after_profile_failures_and_summarizes() {
+  local home_dir port_file server_pid output usage_url status=0
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  create_profile_fixture "$home_dir" "gamma" "gamma@example.com" "acct_gamma" "token_gamma"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file" "token_beta,token_gamma")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh --all 2>&1) || status=$?
+  [[ $status -ne 0 ]] || fail "expected refresh --all to exit non-zero when some profiles fail"
+  assert_contains "$output" "Refreshing 1/3: alpha..."
+  assert_contains "$output" "Refreshing 2/3: beta..."
+  assert_contains "$output" "Refreshing 3/3: gamma..."
+  assert_contains "$output" "Refreshed alpha"
+  assert_contains "$output" "Failed beta"
+  assert_contains "$output" "Failed gamma"
+  assert_contains "$output" "2 profiles failed to refresh:"
+  assert_contains "$output" "beta: Unable to refresh usage for 'beta': token_expired:"
+  assert_contains "$output" "gamma: Unable to refresh usage for 'gamma': token_expired:"
+  assert_contains "$output" "PROFILE"
+  assert_contains "$output" "alpha@example.com"
+  assert_contains "$output" "beta@example.com"
+  assert_contains "$output" "gamma@example.com"
+  [[ -f "$home_dir/accounts/profiles/alpha/usage.json" ]] || fail "expected alpha usage.json to be written"
+  [[ ! -f "$home_dir/accounts/profiles/beta/usage.json" ]] || fail "expected beta usage.json to be absent after failure"
+  [[ ! -f "$home_dir/accounts/profiles/gamma/usage.json" ]] || fail "expected gamma usage.json to be absent after failure"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
 main() {
   test_install_help_mentions_dependency_flags
   test_help_mentions_update_command
@@ -362,6 +422,7 @@ main() {
   test_list_uses_local_timezone_by_default_and_utc_when_requested
   test_refresh_without_args_prompts_and_lists_all_profiles
   test_refresh_cancel_shows_usage_instruction
+  test_refresh_continues_after_profile_failures_and_summarizes
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
   test_changelog_tracks_the_current_release_newest_first

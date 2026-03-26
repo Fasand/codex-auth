@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.4.0"
+APP_VERSION="0.4.1"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -623,7 +623,7 @@ PY
 refresh_usage_for_profile() {
   local profile_name=$1
   validate_profile_name "$profile_name"
-  local dir auth_path usage_path include_session=0 session_json=""
+  local dir auth_path usage_path include_session=0 session_json="" error_file output status
   dir=$(profile_dir "$profile_name")
   [[ -d "$dir" ]] || die "Unknown profile '$profile_name'"
   auth_path=$(profile_auth_path "$profile_name")
@@ -633,12 +633,92 @@ refresh_usage_for_profile() {
       include_session=1
     fi
   fi
-  refresh_usage_python "$auth_path" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null
+  error_file=$(mktemp)
+  if refresh_usage_python "$auth_path" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null 2>"$error_file"; then
+    rm -f "$error_file"
+    return 0
+  else
+    status=$?
+  fi
+  output=$(cat "$error_file")
+  rm -f "$error_file"
+  output=${output//$'\n'/ }
+  printf '%s\n' "$output"
+  return "$status"
 }
 
 best_effort_refresh_usage() {
   local profile_name=$1
   refresh_usage_for_profile "$profile_name" >/dev/null 2>&1 || true
+}
+
+refresh_progress_bar() {
+  local completed=$1
+  local total=$2
+  local width=${3:-12}
+  local filled=0 empty=0 i
+  (( total > 0 )) || total=1
+  (( completed < 0 )) && completed=0
+  (( completed > total )) && completed=$total
+  filled=$(( completed * width / total ))
+  empty=$(( width - filled ))
+  printf '['
+  for ((i = 0; i < filled; i++)); do
+    printf '#'
+  done
+  for ((i = 0; i < empty; i++)); do
+    printf '.'
+  done
+  printf ']'
+}
+
+refresh_progress_begin() {
+  local index=$1
+  local total=$2
+  local profile_name=$3
+  if [[ -t 2 ]]; then
+    printf '\rRefreshing %d/%d %s %s...\033[K' "$index" "$total" "$(refresh_progress_bar "$((index - 1))" "$total")" "$profile_name" >&2
+  else
+    printf 'Refreshing %d/%d: %s... ' "$index" "$total" "$profile_name" >&2
+  fi
+}
+
+refresh_progress_finish() {
+  local index=$1
+  local total=$2
+  local profile_name=$3
+  local outcome=$4
+  local detail=${5:-}
+  if [[ -t 2 ]]; then
+    if [[ "$outcome" == "ok" ]]; then
+      printf '\rRefreshed  %d/%d %s %s\033[K\n' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+    else
+      printf '\rFailed     %d/%d %s %s — see summary below\033[K\n' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+    fi
+    return 0
+  fi
+
+  if [[ "$outcome" == "ok" ]]; then
+    note "Refreshed $profile_name"
+  else
+    note "Failed $profile_name: $detail"
+  fi
+}
+
+collect_refresh_targets() {
+  local target=${1:-}
+  local name
+  if [[ "$target" == "--all" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      printf '%s\n' "$name"
+    done < <(list_profile_names)
+    return 0
+  fi
+
+  validate_profile_name "$target"
+  [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+  printf '%s\n' "$target"
 }
 
 render_profile_table() {
@@ -992,24 +1072,51 @@ refresh_usage_command() {
   local target=${1:-}
   local use_utc=${2:-0}
   local confirm_status=0
+  local name error
+  local index=0 total=0 failure_count=0
+  local -a targets=() failure_names=() failure_errors=()
   if [[ -z "$target" ]]; then
     confirm_refresh_all_profiles || confirm_status=$?
     [[ $confirm_status -eq 0 ]] || return "$confirm_status"
     target="--all"
   fi
-  if [[ "$target" == "--all" ]]; then
-    local any=0 name
-    while IFS= read -r name; do
-      [[ -n "$name" ]] || continue
-      any=1
-      refresh_usage_for_profile "$name"
-    done < <(list_profile_names)
-    [[ $any -eq 1 ]] || die "No saved profiles to refresh"
-    list_profiles "$use_utc"
-    return 0
-  fi
-  refresh_usage_for_profile "$target"
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    targets+=("$name")
+  done < <(collect_refresh_targets "$target")
+
+  total=${#targets[@]}
+  (( total > 0 )) || die "No saved profiles to refresh"
+
+  for name in "${targets[@]}"; do
+    index=$((index + 1))
+    refresh_progress_begin "$index" "$total" "$name"
+    error=""
+    if error=$(refresh_usage_for_profile "$name"); then
+      refresh_progress_finish "$index" "$total" "$name" "ok"
+      continue
+    fi
+    failure_names+=("$name")
+    failure_errors+=("$error")
+    failure_count=$((failure_count + 1))
+    refresh_progress_finish "$index" "$total" "$name" "fail" "$error"
+  done
+
   list_profiles "$use_utc"
+
+  if (( failure_count > 0 )); then
+    if (( failure_count == 1 )); then
+      note "1 profile failed to refresh:"
+    else
+      note "$failure_count profiles failed to refresh:"
+    fi
+    for index in "${!failure_names[@]}"; do
+      note "- ${failure_names[index]}: ${failure_errors[index]}"
+    done
+    return 1
+  fi
+  return 0
 }
 
 resolve_current_executable_path() {

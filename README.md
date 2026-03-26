@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.4.0`
+Current version: `0.4.1`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -13,7 +13,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Save the current Codex auth snapshot as a named profile
 - Switch between saved profiles
 - List profiles with cached usage information
-- Refresh live usage data for one or all profiles, then immediately show the updated list
+- Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
 
@@ -146,6 +146,12 @@ Run `codex-auth help` for the full command reference.
 - `list`, `current`, `refresh-usage`, and `refresh` display reset/check timestamps in your local timezone by default.
 - Pass `--utc` to any of those commands if you want the older UTC-style output.
 - If a local timezone cannot be determined, the CLI falls back to UTC.
+
+### Refresh behavior
+
+- `codex-auth refresh-usage` or `codex-auth refresh` with no profile name asks for confirmation before refreshing every saved profile.
+- Multi-profile refreshes show progress as each profile is processed.
+- If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
 
 ## Bash completions
 

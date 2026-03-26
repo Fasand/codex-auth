@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.4.1 - 2026-03-26
+
+- Added visible refresh progress output so multi-profile usage refreshes show which profile is currently being processed and how far through the batch they are.
+- Changed refresh-all flows to continue past per-profile failures, then summarize every failed profile at the end instead of stopping at the first expired token.
+- Kept the automatic post-refresh profile list while returning a non-zero exit status when any profile refresh fails.
+
 ## 0.4.0 - 2026-03-26
 
 - Switched profile date/time displays to the current local timezone by default and added `--utc` for `list`, `current`, `refresh-usage`, and `refresh`.
