@@ -2,6 +2,11 @@
 
 Newest releases go at the top.
 
+## 0.4.2 - 2026-03-26
+
+- Changed interactive refresh progress to use a single live-updating terminal line instead of leaving one progress-bar line per profile.
+- Kept non-interactive refresh output simple and line-based, without progress bars, so logs and captured output stay readable.
+
 ## 0.4.1 - 2026-03-26
 
 - Added visible refresh progress output so multi-profile usage refreshes show which profile is currently being processed and how far through the batch they are.

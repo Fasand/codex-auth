@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.4.1"
+EXPECTED_VERSION="0.4.2"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -347,6 +347,7 @@ test_refresh_without_args_prompts_and_lists_all_profiles() {
   assert_contains "$output" "Refreshing 2/2: beta..."
   assert_contains "$output" "Refreshed alpha"
   assert_contains "$output" "Refreshed beta"
+  assert_not_contains "$output" "Refreshing 1/2 ["
   assert_contains "$output" "alpha"
   assert_contains "$output" "beta"
   assert_contains "$output" "84%"
@@ -391,6 +392,7 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
   assert_contains "$output" "Refreshed alpha"
   assert_contains "$output" "Failed beta"
   assert_contains "$output" "Failed gamma"
+  assert_not_contains "$output" "Refreshing 1/3 ["
   assert_contains "$output" "2 profiles failed to refresh:"
   assert_contains "$output" "beta: Unable to refresh usage for 'beta': token_expired:"
   assert_contains "$output" "gamma: Unable to refresh usage for 'gamma': token_expired:"

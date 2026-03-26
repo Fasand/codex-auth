@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.4.1"
+APP_VERSION="0.4.2"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -691,9 +691,9 @@ refresh_progress_finish() {
   local detail=${5:-}
   if [[ -t 2 ]]; then
     if [[ "$outcome" == "ok" ]]; then
-      printf '\rRefreshed  %d/%d %s %s\033[K\n' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+      printf '\rRefreshed  %d/%d %s %s\033[K' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
     else
-      printf '\rFailed     %d/%d %s %s — see summary below\033[K\n' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
+      printf '\rFailed     %d/%d %s %s — see summary below\033[K' "$index" "$total" "$(refresh_progress_bar "$index" "$total")" "$profile_name" >&2
     fi
     return 0
   fi
@@ -703,6 +703,11 @@ refresh_progress_finish() {
   else
     note "Failed $profile_name: $detail"
   fi
+}
+
+refresh_progress_clear() {
+  [[ -t 2 ]] || return 0
+  printf '\r\033[K' >&2
 }
 
 collect_refresh_targets() {
@@ -1103,6 +1108,7 @@ refresh_usage_command() {
     refresh_progress_finish "$index" "$total" "$name" "fail" "$error"
   done
 
+  refresh_progress_clear
   list_profiles "$use_utc"
 
   if (( failure_count > 0 )); then
