@@ -1036,8 +1036,44 @@ switch_profile() {
       local outgoing_auth_path outgoing_meta_path
       outgoing_auth_path=$(profile_auth_path "$current_name")
       outgoing_meta_path=$(profile_meta_path "$current_name")
-      cp "$AUTH_FILE" "$outgoing_auth_path"
-      write_meta_file "$current_name" "$outgoing_auth_path" "$outgoing_meta_path"
+      # Guard: verify the live auth.json belongs to the same account as the
+      # outgoing profile before overwriting its snapshot.  If identity cannot
+      # be confirmed (missing meta, missing fields, mismatch), skip silently.
+      local _do_presave=1
+      if [[ -f "$outgoing_meta_path" ]]; then
+        local _live_account_id _meta_account_id _live_email _meta_email
+        _live_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('tokens',{}).get('account_id',''))" "$AUTH_FILE" 2>/dev/null || true)
+        _meta_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('accountId',''))" "$outgoing_meta_path" 2>/dev/null || true)
+        if [[ -n "$_live_account_id" && -n "$_meta_account_id" ]]; then
+          [[ "$_live_account_id" == "$_meta_account_id" ]] || _do_presave=0
+        else
+          # Fall back to email comparison
+          _live_email=$(python3 -c "
+import base64,json,sys
+t=json.load(open(sys.argv[1])).get('tokens',{}).get('id_token','')
+parts=t.split('.') if isinstance(t,str) and '.' in t else []
+if len(parts)>=2:
+    p=parts[1]+'='*(-len(parts[1])%4)
+    try: print(json.loads(base64.urlsafe_b64decode(p)).get('email',''))
+    except: print('')
+else: print('')
+" "$AUTH_FILE" 2>/dev/null || true)
+          _meta_email=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('email',''))" "$outgoing_meta_path" 2>/dev/null || true)
+          if [[ -n "$_live_email" && -n "$_meta_email" ]]; then
+            [[ "$_live_email" == "$_meta_email" ]] || _do_presave=0
+          else
+            # Cannot verify identity — skip pre-save to be safe
+            _do_presave=0
+          fi
+        fi
+      else
+        # No meta.json for the outgoing profile — skip pre-save to be safe
+        _do_presave=0
+      fi
+      if [[ "$_do_presave" == "1" ]]; then
+        cp "$AUTH_FILE" "$outgoing_auth_path"
+        write_meta_file "$current_name" "$outgoing_auth_path" "$outgoing_meta_path"
+      fi
     fi
   fi
 
