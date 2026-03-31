@@ -329,8 +329,19 @@ test_list_uses_local_timezone_by_default_and_utc_when_requested() {
   cp "$home_dir/accounts/profiles/encor/auth.json" "$home_dir/auth.json"
   write_usage_fixture "$home_dir" "encor" 84 1774656360 61 1774829160
 
+  # The script captures a fixed offset from the current moment (CET or CEST),
+  # so compute the expected local time dynamically to stay DST-safe.
+  local expected_local
+  expected_local=$(TZ=Europe/Prague python3 -c "
+import datetime as dt
+local_tz = dt.datetime.now().astimezone().tzinfo
+ts = dt.datetime.fromtimestamp(1774656360, tz=dt.timezone.utc)
+loc = ts.astimezone(local_tz)
+print(loc.strftime('%H:%M ') + (loc.tzname() or 'UTC'))
+")
+
   output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
-  assert_contains "$output" "01:06 CET"
+  assert_contains "$output" "$expected_local"
   assert_contains "$output" "28 Mar"
   assert_not_contains "$output" "00:06Z"
 
