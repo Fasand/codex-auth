@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.4.3"
+APP_VERSION="0.4.4"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
 ACCOUNTS_DIR="$CODEX_HOME/accounts"
@@ -643,6 +643,43 @@ refresh_usage_for_profile() {
   output=$(cat "$error_file")
   rm -f "$error_file"
   output=${output//$'\n'/ }
+
+  # Fallback: if the error looks like a token_expired 401 and this is the
+  # currently selected profile, retry with the live auth.json.
+  if [[ "$output" == *"token_expired"* || "$output" == *"expired"* || "$output" == *"sign in again"* || "$output" == *"signing in again"* ]]; then
+    local current_name=""
+    if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
+      current_name=$(cat "$CURRENT_PROFILE_FILE")
+    fi
+    if [[ -n "$current_name" && "$current_name" == "$profile_name" && -f "$AUTH_FILE" ]]; then
+      # The snapshot may be stale — retry with the live session token
+      local live_error_file live_output live_status
+      live_error_file=$(mktemp)
+      if refresh_usage_python "$AUTH_FILE" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null 2>"$live_error_file"; then
+        rm -f "$live_error_file"
+        # Success with live token — sync snapshot from live session
+        local meta_path
+        meta_path=$(profile_meta_path "$profile_name")
+        cp "$AUTH_FILE" "$auth_path"
+        write_meta_file "$profile_name" "$auth_path" "$meta_path"
+        note "snapshot was stale — auto-synced from live Codex session"
+        return 0
+      else
+        live_status=$?
+      fi
+      live_output=$(cat "$live_error_file")
+      rm -f "$live_error_file"
+      live_output=${live_output//$'\n'/ }
+      if [[ "$live_output" == *"token_expired"* || "$live_output" == *"expired"* || "$live_output" == *"sign in again"* || "$live_output" == *"signing in again"* ]]; then
+        printf '%s\n' "Token expired in both snapshot and live session — please re-login"
+        return "$live_status"
+      fi
+      # Live token failed with a different error — report it
+      printf '%s\n' "$live_output"
+      return "$live_status"
+    fi
+  fi
+
   printf '%s\n' "$output"
   return "$status"
 }
@@ -990,6 +1027,56 @@ switch_profile() {
   [[ -d "$dir" ]] || die "Unknown profile '$target'"
   src="$dir/auth.json"
   [[ -f "$src" ]] || die "Profile '$target' is missing auth.json"
+
+  # Pre-switch: save live auth.json back to the outgoing profile snapshot
+  if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
+    local current_name
+    current_name=$(cat "$CURRENT_PROFILE_FILE")
+    if [[ -n "$current_name" && -d "$(profile_dir "$current_name")" && -f "$AUTH_FILE" ]]; then
+      local outgoing_auth_path outgoing_meta_path
+      outgoing_auth_path=$(profile_auth_path "$current_name")
+      outgoing_meta_path=$(profile_meta_path "$current_name")
+      # Guard: verify the live auth.json belongs to the same account as the
+      # outgoing profile before overwriting its snapshot.  If identity cannot
+      # be confirmed (missing meta, missing fields, mismatch), skip silently.
+      local _do_presave=1
+      if [[ -f "$outgoing_meta_path" ]]; then
+        local _live_account_id _meta_account_id _live_email _meta_email
+        _live_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('tokens',{}).get('account_id',''))" "$AUTH_FILE" 2>/dev/null || true)
+        _meta_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('accountId',''))" "$outgoing_meta_path" 2>/dev/null || true)
+        if [[ -n "$_live_account_id" && -n "$_meta_account_id" ]]; then
+          [[ "$_live_account_id" == "$_meta_account_id" ]] || _do_presave=0
+        else
+          # Fall back to email comparison
+          _live_email=$(python3 -c "
+import base64,json,sys
+t=json.load(open(sys.argv[1])).get('tokens',{}).get('id_token','')
+parts=t.split('.') if isinstance(t,str) and '.' in t else []
+if len(parts)>=2:
+    p=parts[1]+'='*(-len(parts[1])%4)
+    try: print(json.loads(base64.urlsafe_b64decode(p)).get('email',''))
+    except: print('')
+else: print('')
+" "$AUTH_FILE" 2>/dev/null || true)
+          _meta_email=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('email',''))" "$outgoing_meta_path" 2>/dev/null || true)
+          if [[ -n "$_live_email" && -n "$_meta_email" ]]; then
+            [[ "$_live_email" == "$_meta_email" ]] || _do_presave=0
+          else
+            # Cannot verify identity — skip pre-save to be safe
+            _do_presave=0
+          fi
+        fi
+      else
+        # No meta.json for the outgoing profile — skip pre-save to be safe
+        _do_presave=0
+      fi
+      if [[ "$_do_presave" == "1" ]]; then
+        cp "$AUTH_FILE" "$outgoing_auth_path"
+        write_meta_file "$current_name" "$outgoing_auth_path" "$outgoing_meta_path"
+      fi
+    fi
+  fi
+
   cp "$src" "$AUTH_FILE"
   write_current_profile_marker "$target"
   note "Switched to '$target'"

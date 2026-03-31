@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.4.4 - 2026-03-31
+
+- Added fallback to the live Codex session token when `refresh-usage` fails with a token_expired 401 on the currently active profile. If the live token succeeds, the stale profile snapshot is auto-synced; if both tokens are expired, a distinct error message is shown.
+- Added silent token sync on `switch`: before switching away from the current profile, the live `auth.json` is copied back to the outgoing profile's snapshot and its meta.json is refreshed, preventing snapshot staleness.
+- Added identity guard for switch pre-save: before overwriting the outgoing profile snapshot, the live auth.json's account_id/email is verified against the profile's meta.json. If the accounts don't match (e.g. after a manual `codex logout && codex login` to a different account), the pre-save is silently skipped to prevent cross-contamination.
+
 ## 0.4.3 - 2026-03-26
 
 - Documented the retained-tag release policy in `AGENTS.md` so future releases keep `0.x.0` and the latest `0.x.y` tag for each minor line.
