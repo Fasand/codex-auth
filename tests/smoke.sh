@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.4.3"
+EXPECTED_VERSION="0.4.4"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -252,7 +252,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-03-26"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-03-31"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
