@@ -1060,7 +1060,7 @@ def fetch_pricing():
         body = response.read().decode('utf-8', 'replace')
     parsed = parse_pricing_document(body)
     return {
-        'cache_schema_version': 2,
+        'cache_schema_version': 3,
         'fetched_at': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'source_url': pricing_url,
         'tier': 'standard',
@@ -1072,7 +1072,7 @@ def fetch_pricing():
 def get_pricing():
     ttl_seconds = int(pricing_ttl)
     cached = load_cached_pricing()
-    if cached and (cached.get('cache_schema_version') != 2 or cached.get('tier') != 'standard'):
+    if cached and (cached.get('cache_schema_version') != 3 or cached.get('tier') != 'standard'):
         cached = None
     cached_age = None
     if cached and cached.get('fetched_at'):

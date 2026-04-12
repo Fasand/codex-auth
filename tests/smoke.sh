@@ -589,6 +589,36 @@ test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page() {
   assert_not_contains "$output" 'gpt-5.1-codex-max → gpt-5.4'
 }
 
+test_stats_invalidates_old_pricing_cache_schema() {
+  local home_dir pricing_file cache_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  cache_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture_multi_section "$pricing_file"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-53" "2026-04-12T08:07:00Z" "gpt-5.3-codex" 1000000 0 0 0 1000000
+  cat > "$cache_file" <<'JSON'
+{
+  "cache_schema_version": 2,
+  "tier": "standard",
+  "fetched_at": "2026-04-12T12:00:00Z",
+  "fallback_model": "gpt-5.4",
+  "models": {
+    "gpt-5.4": {
+      "input": 2.5,
+      "cached_input": 0.25,
+      "output": 15
+    }
+  }
+}
+JSON
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_PRICING_CACHE_PATH="$cache_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" 'gpt-5.3-codex'
+  assert_contains "$output" '$1.75'
+  assert_not_contains "$output" 'gpt-5.3-codex → gpt-5.4'
+}
+
 main() {
   test_install_help_mentions_dependency_flags
   test_help_mentions_update_command
@@ -612,6 +642,7 @@ main() {
   test_statistics_alias_and_all_period_cap_daily_rows
   test_stats_uses_standard_pricing_tier_and_explains_cost_methodology
   test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page
+  test_stats_invalidates_old_pricing_cache_schema
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
   test_changelog_tracks_the_current_release_newest_first
