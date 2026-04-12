@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.5.0 - 2026-04-12
+
+- Added a new global `stats` command, with `statistics` as an alias, to summarize historical Codex rollout token usage across today, 7d, 14d, 30d, and all-time windows.
+- Added compact session-usage footer lines to `list` so today and 7d session counts, token totals, and estimated API-equivalent costs are visible without opening the full stats view.
+- Added daily and model breakdowns plus cached official-pricing-based API-equivalent cost estimation, including fallback pricing for unknown-model session events.
+
 ## 0.4.4 - 2026-03-31
 
 - Added fallback to the live Codex session token when `refresh-usage` fails with a token_expired 401 on the currently active profile. If the live token succeeds, the stale profile snapshot is auto-synced; if both tokens are expired, a distinct error message is shown.

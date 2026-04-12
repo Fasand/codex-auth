@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.4.3`
+Current version: `0.5.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -13,6 +13,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Save the current Codex auth snapshot as a named profile
 - Switch between saved profiles
 - List profiles with cached usage information
+- Show a compact global session-usage footer in `list`
+- Inspect historical local session statistics with `stats`
 - Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
@@ -153,6 +155,8 @@ codex-auth save work
 codex-auth switch work
 codex-auth refresh-usage
 codex-auth refresh work
+codex-auth stats
+codex-auth stats --period 7d
 codex-auth update
 codex-auth --version
 ```
@@ -170,6 +174,14 @@ Run `codex-auth help` for the full command reference.
 - `codex-auth refresh-usage` or `codex-auth refresh` with no profile name asks for confirmation before refreshing every saved profile.
 - Multi-profile refreshes show progress as each profile is processed; interactive terminals use a single live-updating line, while non-interactive output stays line-based.
 - If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
+
+### Session statistics
+
+- `codex-auth list` now adds a compact two-line footer with global local-session usage for **today** and **7d** when rollout history exists.
+- `codex-auth stats` is the primary command for historical usage; `codex-auth statistics` is an alias.
+- The stats view always shows overview columns for `today`, `7d`, `14d`, `30d`, and `all`, then focuses the daily/model breakdown on `30d` by default.
+- Use `--period today|7d|14d|30d|all` to change that deeper focus, and `--utc` to use UTC day boundaries instead of local time.
+- Estimated cost is shown as **API-equivalent cost** based on cached official OpenAI pricing, not your actual ChatGPT subscription charge.
 
 ## Bash completions
 
@@ -202,6 +214,8 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 - Profiles are stored under `~/.codex/accounts/profiles`
 - The active auth file remains `~/.codex/auth.json`
 - Usage refresh talks to ChatGPT Codex usage endpoints using the saved auth token
+- Session statistics parse rollout JSONL files under `~/.codex/sessions`
+- Pricing for session cost estimates is cached under `~/.codex/accounts/pricing-cache.json` by default
 - Terminal colors are enabled automatically on color-capable terminals and can be disabled with `NO_COLOR=1`
 - This project is intentionally small and practical; the code favors usefulness over ceremony
 
