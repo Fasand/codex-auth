@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.5.0"
+APP_VERSION="0.5.1"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -983,6 +983,18 @@ def money_per_day(total, days):
     return money(total / max(1, days))
 
 
+def money_rate(value):
+    if value is None:
+        return 'n/a'
+    if value == 0:
+        return '$0.00'
+    if abs(value) < 0.1:
+        return f"${value:,.3f}".rstrip('0').rstrip('.')
+    if abs(value) < 1:
+        return f"${value:,.3f}".rstrip('0').rstrip('.')
+    return f"${value:,.2f}"
+
+
 def normalize_model(name):
     if not name:
         return None
@@ -992,15 +1004,21 @@ def normalize_model(name):
 
 def parse_pricing_document(body):
     decoded = html.unescape(body)
-    standard_marker = 'tier":[0,"standard"]'
-    priority_marker = 'tier":[0,"priority"]'
-    if standard_marker in decoded:
-        start = decoded.index(standard_marker)
-        end = decoded.find(priority_marker, start)
-        decoded = decoded[start:end if end != -1 else len(decoded)]
+    standard_markers = ['tier":[0,"standard"]', 'data-value="standard"']
+    priority_markers = ['tier":[0,"priority"]', 'data-value="priority"']
+    marker_mode = any(marker in decoded for marker in standard_markers)
     pattern = re.compile(r'\[\[0,"([^"]+)"\],\[0,([0-9.]+|"-")\],\[0,([0-9.]+|"-")\],\[0,([0-9.]+|"-")\]\]')
     models = {}
-    for raw_name, input_rate, cached_input_rate, output_rate in pattern.findall(decoded):
+    for match in pattern.finditer(decoded):
+        raw_name, input_rate, cached_input_rate, output_rate = match.groups()
+        if marker_mode:
+            match_pos = match.start()
+            last_standard = max(decoded.rfind(marker, 0, match_pos) for marker in standard_markers)
+            last_priority = max(decoded.rfind(marker, 0, match_pos) for marker in priority_markers)
+            if last_standard == -1:
+                continue
+            if last_priority > last_standard:
+                continue
         name = normalize_model(raw_name)
         if not name:
             continue
@@ -1042,7 +1060,7 @@ def fetch_pricing():
         body = response.read().decode('utf-8', 'replace')
     parsed = parse_pricing_document(body)
     return {
-        'cache_schema_version': 2,
+        'cache_schema_version': 3,
         'fetched_at': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
         'source_url': pricing_url,
         'tier': 'standard',
@@ -1054,7 +1072,7 @@ def fetch_pricing():
 def get_pricing():
     ttl_seconds = int(pricing_ttl)
     cached = load_cached_pricing()
-    if cached and (cached.get('cache_schema_version') != 2 or cached.get('tier') != 'standard'):
+    if cached and (cached.get('cache_schema_version') != 3 or cached.get('tier') != 'standard'):
         cached = None
     cached_age = None
     if cached and cached.get('fetched_at'):
@@ -1389,9 +1407,9 @@ for row in focus_summary['models']:
     rates = pricing_models[rates_model]
     pricing_basis_rows.append([
         display_name,
-        f"${rates['input']:.2f}",
-        f"${(rates['cached_input'] if rates.get('cached_input') is not None else rates['input']):.2f}",
-        f"${rates['output']:.2f}",
+        money_rate(rates['input']),
+        money_rate(rates['cached_input'] if rates.get('cached_input') is not None else rates['input']),
+        money_rate(rates['output']),
         mode_label,
     ])
 if pricing_basis_rows:

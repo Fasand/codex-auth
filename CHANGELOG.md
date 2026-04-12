@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.5.1 - 2026-04-12
+
+- Fixed session statistics pricing so older Codex models like `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.1-codex-mini`, and `gpt-5.1-codex-max` are read from the official single OpenAI pricing page instead of falling back to `gpt-5.4`.
+- Tightened pricing-page parsing so only standard-tier rows are used even when the page mixes multiple standard and priority table layouts.
+- Improved pricing-basis formatting so small cached-input rates display with enough precision to audit the calculation.
+
 ## 0.5.0 - 2026-04-12
 
 - Added a new global `stats` command, with `statistics` as an alias, to summarize historical Codex rollout token usage across today, 7d, 14d, 30d, and all-time windows.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.5.0"
+EXPECTED_VERSION="0.5.1"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -118,6 +118,15 @@ write_pricing_fixture_with_priority() {
   cat > "$path" <<'HTML'
 <div data-value="standard"><astro-island props="{&quot;tier&quot;:[0,&quot;standard&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,2.5],[0,0.25],[0,15]]],[1,[[0,&quot;gpt-5.3-codex&quot;],[0,1.75],[0,0.175],[0,14]]]]]}"></astro-island></div>
 <div data-value="priority"><astro-island props="{&quot;tier&quot;:[0,&quot;priority&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,5],[0,0.5],[0,30]]],[1,[[0,&quot;gpt-5.3-codex&quot;],[0,3.5],[0,0.35],[0,28]]]]]}"></astro-island></div>
+HTML
+}
+
+write_pricing_fixture_multi_section() {
+  local path=$1
+  cat > "$path" <<'HTML'
+<div data-value="standard"><astro-island props="{&quot;tier&quot;:[0,&quot;standard&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,2.5],[0,0.25],[0,15]]],[1,[[0,&quot;gpt-5.4-mini&quot;],[0,0.75],[0,0.075],[0,4.5]]],[1,[[0,&quot;gpt-5.4-nano&quot;],[0,0.2],[0,0.02],[0,1.25]]]]]}"></astro-island></div>
+<div data-value="priority"><astro-island props="{&quot;tier&quot;:[0,&quot;priority&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,5],[0,0.5],[0,30]]],[1,[[0,&quot;gpt-5.4-mini&quot;],[0,1.5],[0,0.15],[0,9]]],[1,[[0,&quot;gpt-5.4-nano&quot;],[0,0.4],[0,0.04],[0,2.5]]]]]}"></astro-island></div>
+<div data-value="standard"><astro-island props="{&quot;tier&quot;:[0,&quot;standard&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.3-codex&quot;],[0,1.75],[0,0.175],[0,14]]],[1,[[0,&quot;gpt-5.2-codex&quot;],[0,1.75],[0,0.175],[0,14]]],[1,[[0,&quot;gpt-5.1-codex-max&quot;],[0,1.25],[0,0.125],[0,10]]],[1,[[0,&quot;gpt-5.1-codex-mini&quot;],[0,0.25],[0,0.025],[0,2]]]]]}"></astro-island></div>
 HTML
 }
 
@@ -553,6 +562,63 @@ test_stats_uses_standard_pricing_tier_and_explains_cost_methodology() {
   assert_contains "$output" "output tokens × output rate"
 }
 
+test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page() {
+  local home_dir pricing_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture_multi_section "$pricing_file"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-54mini" "2026-04-12T08:05:00Z" "gpt-5.4-mini" 1000000 0 0 0 1000000
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-54nano" "2026-04-12T08:06:00Z" "gpt-5.4-nano" 1000000 0 0 0 1000000
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-53" "2026-04-12T08:07:00Z" "gpt-5.3-codex" 1000000 0 0 0 1000000
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-52" "2026-04-12T08:08:00Z" "gpt-5.2-codex" 1000000 0 0 0 1000000
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-51mini" "2026-04-12T08:09:00Z" "gpt-5.1-codex-mini" 1000000 0 0 0 1000000
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-51max" "2026-04-12T08:10:00Z" "gpt-5.1-codex-max" 1000000 0 0 0 1000000
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" '$5.95'
+  assert_contains "$output" 'gpt-5.3-codex'
+  assert_contains "$output" 'gpt-5.2-codex'
+  assert_contains "$output" 'gpt-5.1-codex-mini'
+  assert_contains "$output" 'gpt-5.1-codex-max'
+  assert_contains "$output" '$0.025'
+  assert_contains "$output" '$0.175'
+  assert_not_contains "$output" 'gpt-5.3-codex → gpt-5.4'
+  assert_not_contains "$output" 'gpt-5.2-codex → gpt-5.4'
+  assert_not_contains "$output" 'gpt-5.1-codex-mini → gpt-5.4'
+  assert_not_contains "$output" 'gpt-5.1-codex-max → gpt-5.4'
+}
+
+test_stats_invalidates_old_pricing_cache_schema() {
+  local home_dir pricing_file cache_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  cache_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture_multi_section "$pricing_file"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-53" "2026-04-12T08:07:00Z" "gpt-5.3-codex" 1000000 0 0 0 1000000
+  cat > "$cache_file" <<'JSON'
+{
+  "cache_schema_version": 2,
+  "tier": "standard",
+  "fetched_at": "2026-04-12T12:00:00Z",
+  "fallback_model": "gpt-5.4",
+  "models": {
+    "gpt-5.4": {
+      "input": 2.5,
+      "cached_input": 0.25,
+      "output": 15
+    }
+  }
+}
+JSON
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_PRICING_CACHE_PATH="$cache_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" 'gpt-5.3-codex'
+  assert_contains "$output" '$1.75'
+  assert_not_contains "$output" 'gpt-5.3-codex → gpt-5.4'
+}
+
 main() {
   test_install_help_mentions_dependency_flags
   test_help_mentions_update_command
@@ -575,6 +641,8 @@ main() {
   test_stats_reports_overview_daily_and_model_breakdown
   test_statistics_alias_and_all_period_cap_daily_rows
   test_stats_uses_standard_pricing_tier_and_explains_cost_methodology
+  test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page
+  test_stats_invalidates_old_pricing_cache_schema
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
   test_changelog_tracks_the_current_release_newest_first
