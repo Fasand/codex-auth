@@ -16,7 +16,7 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage refresh update rename remove rm delete help"
+  local commands="list current save switch add refresh-usage refresh stats statistics update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
 
@@ -33,9 +33,23 @@ _codex_auth_completion() {
       COMPREPLY=( $(compgen -W "--all --utc $profiles" -- "$cur") )
       return 0
       ;;
+    stats|statistics)
+      COMPREPLY=( $(compgen -W "--utc --period" -- "$cur") )
+      return 0
+      ;;
+    --period)
+      if [[ "$first" == "stats" || "$first" == "statistics" ]]; then
+        COMPREPLY=( $(compgen -W "today 7d 14d 30d all" -- "$cur") )
+        return 0
+      fi
+      ;;
     --utc)
       if [[ "$first" == "refresh-usage" || "$first" == "refresh" ]]; then
         COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+        return 0
+      fi
+      if [[ "$first" == "stats" || "$first" == "statistics" ]]; then
+        COMPREPLY=( $(compgen -W "--period" -- "$cur") )
         return 0
       fi
       ;;

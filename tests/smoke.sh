@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.4.4"
+EXPECTED_VERSION="0.5.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -81,6 +81,44 @@ write_usage_fixture() {
   }
 }
 JSON
+}
+
+write_rollout_fixture() {
+  local home_dir=$1
+  local relative_dir=$2
+  local rollout_name=$3
+  local timestamp=$4
+  local model=$5
+  local input_tokens=$6
+  local cached_input_tokens=$7
+  local output_tokens=$8
+  local reasoning_output_tokens=$9
+  local total_tokens=${10:-}
+  [[ -n "$total_tokens" ]] || total_tokens=$((input_tokens + output_tokens))
+  mkdir -p "$home_dir/sessions/$relative_dir"
+  {
+    printf '{"timestamp":"%s","type":"session_meta","payload":{"id":"%s"}}\n' "$timestamp" "$rollout_name"
+    if [[ -n "$model" ]]; then
+      printf '{"timestamp":"%s","type":"turn_context","payload":{"model":"%s"}}\n' "$timestamp" "$model"
+    fi
+    printf '{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":%s,"cached_input_tokens":%s,"output_tokens":%s,"reasoning_output_tokens":%s,"total_tokens":%s}}}}\n' \
+      "$timestamp" "$input_tokens" "$cached_input_tokens" "$output_tokens" "$reasoning_output_tokens" "$total_tokens"
+  } > "$home_dir/sessions/$relative_dir/$rollout_name.jsonl"
+}
+
+write_pricing_fixture() {
+  local path=$1
+  cat > "$path" <<'HTML'
+<div props="{&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,2.5],[0,0.25],[0,15]]],[1,[[0,&quot;gpt-5.3-codex&quot;],[0,1.75],[0,0.175],[0,14]]]]]}"></div>
+HTML
+}
+
+write_pricing_fixture_with_priority() {
+  local path=$1
+  cat > "$path" <<'HTML'
+<div data-value="standard"><astro-island props="{&quot;tier&quot;:[0,&quot;standard&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,2.5],[0,0.25],[0,15]]],[1,[[0,&quot;gpt-5.3-codex&quot;],[0,1.75],[0,0.175],[0,14]]]]]}"></astro-island></div>
+<div data-value="priority"><astro-island props="{&quot;tier&quot;:[0,&quot;priority&quot;],&quot;rows&quot;:[1,[[1,[[0,&quot;gpt-5.4 (&lt;272K context length)&quot;],[0,5],[0,0.5],[0,30]]],[1,[[0,&quot;gpt-5.3-codex&quot;],[0,3.5],[0,0.35],[0,28]]]]]}"></astro-island></div>
+HTML
 }
 
 start_mock_usage_server() {
@@ -169,6 +207,8 @@ test_help_mentions_update_command() {
   local output
   output=$(bash "$ROOT_DIR/bin/codex-auth" help)
   assert_contains "$output" "update"
+  assert_contains "$output" "stats [--utc] [--period <today|7d|14d|30d|all>]"
+  assert_contains "$output" "statistics [--utc] [--period <today|7d|14d|30d|all>]"
 }
 
 test_help_mentions_refresh_alias_and_utc_flag() {
@@ -252,7 +292,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-03-31"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-04-12"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
@@ -271,7 +311,10 @@ test_completion_lists_update_command() {
   completion=$(cat "$ROOT_DIR/completions/codex-auth.bash")
   assert_contains "$completion" "update"
   assert_contains "$completion" "refresh"
+  assert_contains "$completion" "stats"
+  assert_contains "$completion" "statistics"
   assert_contains "$completion" "--utc"
+  assert_contains "$completion" "--period"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -429,6 +472,87 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
   trap - RETURN
 }
 
+test_list_shows_compact_session_usage_footer() {
+  local home_dir pricing_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_usage_fixture "$home_dir" "demo" 88 1774656360 77 1774829160
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
+  write_rollout_fixture "$home_dir" "2026/04/08" "rollout-b" "2026-04-08T08:05:00Z" "gpt-5.3-codex" 2000 500 200 80 2200
+  write_pricing_fixture "$pricing_file"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "Session usage: today 1 session"
+  assert_contains "$output" '$0.0036 API-eq'
+  assert_contains "$output" "1.1k tokens"
+  assert_contains "$output" "Session usage: 7d    2 sessions"
+  assert_contains "$output" '$0.0091 API-eq'
+}
+
+test_stats_reports_overview_daily_and_model_breakdown() {
+  local home_dir pricing_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
+  write_rollout_fixture "$home_dir" "2026/04/08" "rollout-b" "2026-04-08T08:05:00Z" "gpt-5.3-codex" 2000 500 200 80 2200
+  write_rollout_fixture "$home_dir" "2026/03/20" "rollout-c" "2026-03-20T08:05:00Z" "" 1500 300 150 70 1650
+  write_pricing_fixture "$pricing_file"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats)
+  assert_contains "$output" "Session statistics (local time)"
+  assert_contains "$output" "All (24d)"
+  assert_contains "$output" "API-eq / day"
+  assert_contains "$output" '$0.0013'
+  assert_contains "$output" "Daily activity (30d)"
+  assert_contains "$output" "Model breakdown (30d)"
+  assert_contains "$output" "gpt-5.3-codex"
+  assert_contains "$output" "unknown*"
+  assert_contains "$output" "Unknown-model events use fallback pricing from gpt-5.4"
+  assert_contains "$output" "Reasoning output is shown separately for visibility"
+}
+
+test_statistics_alias_and_all_period_cap_daily_rows() {
+  local home_dir pricing_file output count i day rel_dir timestamp
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture "$pricing_file"
+  for i in $(seq 0 34); do
+    day=$(python3 - <<PY
+import datetime as dt
+print((dt.date(2026, 4, 12) - dt.timedelta(days=$i)).isoformat())
+PY
+)
+    rel_dir=${day//-//}
+    timestamp="${day}T08:05:00Z"
+    write_rollout_fixture "$home_dir" "$rel_dir" "rollout-$i" "$timestamp" "gpt-5.4" 1000 100 100 10 1100
+  done
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" statistics --period all)
+  assert_contains "$output" "Daily activity (All (35d)), latest 31 days shown"
+  count=$(printf '%s\n' "$output" | grep -c '^2026-')
+  [[ "$count" -eq 31 ]] || fail "expected 31 daily rows in all-period view, got $count"
+}
+
+test_stats_uses_standard_pricing_tier_and_explains_cost_methodology() {
+  local home_dir pricing_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
+  write_pricing_fixture_with_priority "$pricing_file"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" '$0.0036'
+  assert_not_contains "$output" '$0.0072'
+  assert_contains "$output" "Cost methodology:"
+  assert_contains "$output" "(input tokens - cached input tokens) × input rate"
+  assert_contains "$output" "cached input tokens × cached-input rate"
+  assert_contains "$output" "output tokens × output rate"
+}
+
 main() {
   test_install_help_mentions_dependency_flags
   test_help_mentions_update_command
@@ -447,6 +571,10 @@ main() {
   test_refresh_without_args_prompts_and_lists_all_profiles
   test_refresh_cancel_shows_usage_instruction
   test_refresh_continues_after_profile_failures_and_summarizes
+  test_list_shows_compact_session_usage_footer
+  test_stats_reports_overview_daily_and_model_breakdown
+  test_statistics_alias_and_all_period_cap_daily_rows
+  test_stats_uses_standard_pricing_tier_and_explains_cost_methodology
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report
   test_changelog_tracks_the_current_release_newest_first
