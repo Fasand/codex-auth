@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.6.0"
+APP_VERSION="0.7.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -27,6 +27,7 @@ export CODEX_AUTH_THEME_RATE_STYLE="${CODEX_AUTH_THEME_RATE_STYLE:-35}"
 export CODEX_AUTH_THEME_PERCENT_OK_STYLE="${CODEX_AUTH_THEME_PERCENT_OK_STYLE:-32}"
 export CODEX_AUTH_THEME_PERCENT_WARN_STYLE="${CODEX_AUTH_THEME_PERCENT_WARN_STYLE:-33}"
 export CODEX_AUTH_THEME_PERCENT_BAD_STYLE="${CODEX_AUTH_THEME_PERCENT_BAD_STYLE:-31}"
+export CODEX_AUTH_THEME_ISSUE_STYLE="${CODEX_AUTH_THEME_ISSUE_STYLE:-31}"
 
 usage() {
   cat <<USAGE
@@ -432,6 +433,50 @@ raise SystemExit(last_error)
 PY
 }
 
+record_profile_refresh_error() {
+  local profile_name=$1
+  local usage_path=$2
+  local message=$3
+  python3 - "$profile_name" "$usage_path" "$message" <<'PY'
+import datetime as dt
+import json
+import re
+import sys
+from pathlib import Path
+
+profile_name, usage_path, message = sys.argv[1:4]
+path = Path(usage_path)
+try:
+    usage = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+    if not isinstance(usage, dict):
+        usage = {}
+except Exception:
+    usage = {}
+
+summary = ' '.join(str(message or '').split())
+prefix = f"Unable to refresh usage for '{profile_name}': "
+if summary.startswith(prefix):
+    summary = summary[len(prefix):]
+summary = re.split(r'\s+This profile needs to be logged in again\.', summary, maxsplit=1)[0]
+summary = re.split(r'\s+Run:\s+', summary, maxsplit=1)[0]
+summary = summary.strip() or 'refresh failed'
+
+if 'token expired in both snapshot and live session' in summary.lower():
+    summary = 'token expired — re-login required'
+
+if len(summary) > 120:
+    summary = summary[:117].rstrip() + '...'
+
+usage['lastRefreshError'] = {
+    'failedAt': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'summary': summary,
+    'message': str(message or '').strip(),
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(usage, indent=2, sort_keys=True), encoding='utf-8')
+PY
+}
+
 profile_display_payload_json() {
   local profile_name=$1
   local meta_path=$2
@@ -449,6 +494,7 @@ meta = json.loads(Path(meta_path).read_text()) if Path(meta_path).exists() else 
 usage = json.loads(Path(usage_path).read_text()) if Path(usage_path).exists() else {}
 derived = usage.get('derived') or {}
 session = usage.get('session') or {}
+last_error = usage.get('lastRefreshError') or {}
 is_active = profile_name == active_name
 local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
 
@@ -513,6 +559,8 @@ payload = {
     'checked': format_datetime(usage.get('fetchedAt')),
     'token_expires': format_datetime(meta.get('tokenExpiresAt')),
     'last_refresh': format_datetime(meta.get('lastRefresh')),
+    'issue': last_error.get('summary') if isinstance(last_error, dict) else '',
+    'issue_failed_at': format_datetime(last_error.get('failedAt')) if isinstance(last_error, dict) else '',
 }
 print(json.dumps(payload))
 PY
@@ -569,7 +617,8 @@ def percent_style(value):
 
 parts = []
 marker = paint('*', 'CODEX_AUTH_THEME_ACTIVE_STYLE') if payload.get('active') else '-'
-parts.append(f"{marker} {paint(payload.get('profile') or 'unknown-profile', 'CODEX_AUTH_THEME_PROFILE_STYLE')}")
+profile_style = 'CODEX_AUTH_THEME_ISSUE_STYLE' if payload.get('issue') else 'CODEX_AUTH_THEME_PROFILE_STYLE'
+parts.append(f"{marker} {paint(payload.get('profile') or 'unknown-profile', profile_style)}")
 if payload.get('email'):
     parts.append(payload['email'])
 if payload.get('account'):
@@ -588,6 +637,8 @@ if payload.get('weekly'):
     parts.append(segment)
 if payload.get('checked'):
     parts.append(f"checked={paint(payload['checked'], 'CODEX_AUTH_THEME_DIM_STYLE')}")
+if payload.get('issue'):
+    parts.append(f"issue={paint(payload['issue'], 'CODEX_AUTH_THEME_ISSUE_STYLE')}")
 print(' | '.join(parts))
 PY
 }
@@ -687,15 +738,19 @@ refresh_usage_for_profile() {
       rm -f "$live_error_file"
       live_output=${live_output//$'\n'/ }
       if [[ "$live_output" == *"token_expired"* || "$live_output" == *"expired"* || "$live_output" == *"sign in again"* || "$live_output" == *"signing in again"* ]]; then
-        printf '%s\n' "Token expired in both snapshot and live session — please re-login"
+        local token_expired_message="Token expired in both snapshot and live session — please re-login"
+        record_profile_refresh_error "$profile_name" "$usage_path" "$token_expired_message"
+        printf '%s\n' "$token_expired_message"
         return "$live_status"
       fi
       # Live token failed with a different error — report it
+      record_profile_refresh_error "$profile_name" "$usage_path" "$live_output"
       printf '%s\n' "$live_output"
       return "$live_status"
     fi
   fi
 
+  record_profile_refresh_error "$profile_name" "$usage_path" "$output"
   printf '%s\n' "$output"
   return "$status"
 }
@@ -754,7 +809,7 @@ refresh_progress_finish() {
   if [[ "$outcome" == "ok" ]]; then
     note "Refreshed $profile_name"
   else
-    note "Failed $profile_name: $detail"
+    note "Failed $profile_name"
   fi
 }
 
@@ -826,21 +881,26 @@ def percent_style(value):
 
 def profile_cell(row):
     marker = paint('*', 'CODEX_AUTH_THEME_ACTIVE_STYLE') if row.get('active') else ' '
-    profile = paint(row.get('profile') or '', 'CODEX_AUTH_THEME_PROFILE_STYLE')
+    style = 'CODEX_AUTH_THEME_ISSUE_STYLE' if row.get('issue') else 'CODEX_AUTH_THEME_PROFILE_STYLE'
+    profile = paint(row.get('profile') or '', style)
     return f"{marker} {profile}"
 
 
-profile_plain_cells = [("* " if row.get('active') else "  ") + (row.get('profile') or '') for row in rows]
+healthy_rows = [row for row in rows if not row.get('issue')]
+issue_rows = [row for row in rows if row.get('issue')]
+display_rows = healthy_rows + issue_rows
+
+profile_plain_cells = [("* " if row.get('active') else "  ") + (row.get('profile') or '') for row in display_rows]
 headers = ['PROFILE', 'EMAIL', 'PLAN', '5H', 'RESET', 'WEEKLY', 'RESET', 'CHECKED']
 columns = [
     profile_plain_cells,
-    [row.get('email') or '' for row in rows],
-    [row.get('plan') or '' for row in rows],
-    [row.get('five_hour') or '' for row in rows],
-    [row.get('five_hour_reset') or '' for row in rows],
-    [row.get('weekly') or '' for row in rows],
-    [row.get('weekly_reset') or '' for row in rows],
-    [row.get('checked') or '' for row in rows],
+    [row.get('email') or '' for row in display_rows],
+    [row.get('plan') or '' for row in display_rows],
+    [row.get('five_hour') or '' for row in display_rows],
+    [row.get('five_hour_reset') or '' for row in display_rows],
+    [row.get('weekly') or '' for row in display_rows],
+    [row.get('weekly_reset') or '' for row in display_rows],
+    [row.get('checked') or '' for row in display_rows],
 ]
 widths = []
 for header, values in zip(headers, columns):
@@ -851,8 +911,25 @@ def pad(value, width):
     return (value or '').ljust(width)
 
 
+def table_width():
+    # Mirrors the fixed table layout without adding transient issue text to column widths.
+    return sum(widths) + 19
+
+
+def issue_heading():
+    count = len(issue_rows)
+    noun = 'profile' if count == 1 else 'profiles'
+    verb = 'needs' if count == 1 else 'need'
+    return paint(f"Refresh issue: {count} {noun} {verb} attention", 'CODEX_AUTH_THEME_ISSUE_STYLE')
+
+
+def issue_line(row):
+    message = row.get('issue') or 'refresh failed'
+    return paint(f"↳ issue: {message}", 'CODEX_AUTH_THEME_ISSUE_STYLE')
+
+
 def render_row(index, header=False):
-    row = rows[index] if not header else None
+    row = display_rows[index] if not header else None
     values = [
         headers[0] if header else pad(profile_plain_cells[index], widths[0]),
         headers[1] if header else pad(row.get('email') or '', widths[1]),
@@ -884,8 +961,13 @@ def render_row(index, header=False):
 
 
 print(render_row(0, header=True))
-for index in range(len(rows)):
+for index in range(len(display_rows)):
+    if issue_rows and index == len(healthy_rows):
+        print(paint('-' * max(24, table_width()), 'CODEX_AUTH_THEME_ISSUE_STYLE'))
+        print(issue_heading())
     print(render_row(index))
+    if display_rows[index].get('issue'):
+        print(issue_line(display_rows[index]))
 PY
 }
 
@@ -1872,7 +1954,7 @@ refresh_usage_command() {
   local confirm_status=0
   local name error
   local index=0 total=0 failure_count=0
-  local -a targets=() failure_names=() failure_errors=()
+  local -a targets=()
   if [[ -z "$target" ]]; then
     confirm_refresh_all_profiles || confirm_status=$?
     [[ $confirm_status -eq 0 ]] || return "$confirm_status"
@@ -1895,8 +1977,6 @@ refresh_usage_command() {
       refresh_progress_finish "$index" "$total" "$name" "ok"
       continue
     fi
-    failure_names+=("$name")
-    failure_errors+=("$error")
     failure_count=$((failure_count + 1))
     refresh_progress_finish "$index" "$total" "$name" "fail" "$error"
   done
@@ -1905,14 +1985,7 @@ refresh_usage_command() {
   list_profiles "$use_utc" "$include_stats"
 
   if (( failure_count > 0 )); then
-    if (( failure_count == 1 )); then
-      note "1 profile failed to refresh:"
-    else
-      note "$failure_count profiles failed to refresh:"
-    fi
-    for index in "${!failure_names[@]}"; do
-      note "- ${failure_names[index]}: ${failure_errors[index]}"
-    done
+    note "To repair a profile token, run: codex-auth switch <profile> && codex logout && codex login && codex-auth save <profile>"
     return 1
   fi
   return 0

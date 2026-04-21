@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.6.0"
+EXPECTED_VERSION="0.7.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -78,6 +78,27 @@ write_usage_fixture() {
     "five_hour_reset_at":$five_hour_reset,
     "weekly_remaining_percent":$weekly_remaining,
     "weekly_reset_at":$weekly_reset
+  }
+}
+JSON
+}
+
+write_usage_error_fixture() {
+  local home_dir=$1
+  local profile_name=$2
+  local summary=$3
+  local fetched_at=${4:-2026-03-27T23:10:00Z}
+  cat > "$home_dir/accounts/profiles/$profile_name/usage.json" <<JSON
+{
+  "fetchedAt":"$fetched_at",
+  "derived":{
+    "five_hour_remaining_percent":42,
+    "weekly_remaining_percent":93
+  },
+  "lastRefreshError":{
+    "failedAt":"2026-03-27T23:15:00Z",
+    "summary":"$summary",
+    "message":"Unable to refresh usage for '$profile_name': $summary"
   }
 }
 JSON
@@ -403,6 +424,44 @@ print(loc.strftime('%H:%M ') + (loc.tzname() or 'UTC'))
   assert_contains "$utc_output" "00:06Z"
 }
 
+test_list_groups_profiles_with_refresh_errors_at_the_end() {
+  local home_dir output zeta_line beta_line
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta"
+  create_profile_fixture "$home_dir" "zeta" "zeta@example.com" "acct_zeta"
+  write_usage_fixture "$home_dir" "alpha" 84 1774656360 61 1774829160
+  write_usage_error_fixture "$home_dir" "beta" "token_expired: token expired for token_beta"
+  write_usage_fixture "$home_dir" "zeta" 92 1774656360 88 1774829160
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_not_contains "$output" "ISSUE"
+  assert_contains "$output" "Refresh issue: 1 profile needs attention"
+  assert_contains "$output" "↳ issue: token_expired: token expired for token_beta"
+  assert_contains "$output" "token_expired: token expired for token_beta"
+  assert_contains "$output" "----"
+  zeta_line=$(printf '%s\n' "$output" | grep -n 'zeta@example.com' | cut -d: -f1)
+  beta_line=$(printf '%s\n' "$output" | grep -n 'beta@example.com' | cut -d: -f1)
+  [[ -n "$zeta_line" && -n "$beta_line" ]] || fail "expected beta and zeta rows in list output"
+  (( zeta_line < beta_line )) || fail "expected failed beta profile to be grouped after healthy zeta profile"
+
+  output=$(TZ=Europe/Prague CODEX_AUTH_FORCE_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" $'\033[31mbeta\033[0m'
+  assert_contains "$output" $'\033[31m↳ issue: token_expired: token expired for token_beta\033[0m'
+}
+
+test_list_shows_refresh_issue_heading_when_all_profiles_have_errors() {
+  local home_dir output
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta"
+  write_usage_error_fixture "$home_dir" "beta" "token_expired: token expired for token_beta"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "Refresh issue: 1 profile needs attention"
+  assert_contains "$output" "beta@example.com"
+  assert_contains "$output" "↳ issue: token_expired: token expired for token_beta"
+}
+
 test_refresh_without_args_prompts_and_lists_all_profiles() {
   local home_dir port_file server_pid output usage_url
   home_dir=$(mktemp -d)
@@ -469,16 +528,32 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
   assert_contains "$output" "Failed beta"
   assert_contains "$output" "Failed gamma"
   assert_not_contains "$output" "Refreshing 1/3 ["
-  assert_contains "$output" "2 profiles failed to refresh:"
-  assert_contains "$output" "beta: Unable to refresh usage for 'beta': token_expired:"
-  assert_contains "$output" "gamma: Unable to refresh usage for 'gamma': token_expired:"
+  assert_contains "$output" "Refresh issue: 2 profiles need attention"
+  assert_contains "$output" "↳ issue: token_expired: token expired for token_beta"
+  assert_contains "$output" "↳ issue: token_expired: token expired for token_gamma"
+  assert_not_contains "$output" "ISSUE"
+  assert_contains "$output" "token_expired: token expired for token_beta"
+  assert_contains "$output" "token_expired: token expired for token_gamma"
+  assert_not_contains "$output" "profiles failed to refresh. See issue lines above."
+  assert_not_contains "$output" "profile failed to refresh. See issue lines above."
+  assert_contains "$output" "To repair a profile token, run: codex-auth switch <profile> && codex logout && codex login && codex-auth save <profile>"
+  assert_not_contains "$output" "beta: Unable to refresh usage for 'beta': token_expired:"
+  assert_not_contains "$output" "gamma: Unable to refresh usage for 'gamma': token_expired:"
   assert_contains "$output" "PROFILE"
   assert_contains "$output" "alpha@example.com"
   assert_contains "$output" "beta@example.com"
   assert_contains "$output" "gamma@example.com"
   [[ -f "$home_dir/accounts/profiles/alpha/usage.json" ]] || fail "expected alpha usage.json to be written"
-  [[ ! -f "$home_dir/accounts/profiles/beta/usage.json" ]] || fail "expected beta usage.json to be absent after failure"
-  [[ ! -f "$home_dir/accounts/profiles/gamma/usage.json" ]] || fail "expected gamma usage.json to be absent after failure"
+  [[ -f "$home_dir/accounts/profiles/beta/usage.json" ]] || fail "expected beta usage.json to record refresh failure"
+  [[ -f "$home_dir/accounts/profiles/gamma/usage.json" ]] || fail "expected gamma usage.json to record refresh failure"
+  python3 - "$home_dir/accounts/profiles/beta/usage.json" <<'PY' || fail "expected beta usage.json to include lastRefreshError"
+import json
+import sys
+from pathlib import Path
+
+usage = json.loads(Path(sys.argv[1]).read_text())
+assert usage["lastRefreshError"]["summary"].startswith("token_expired:")
+PY
 
   kill "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
@@ -746,6 +821,8 @@ main() {
   test_update_command_reuses_the_installer_without_cloning
   test_list_works_with_minimal_path
   test_list_uses_local_timezone_by_default_and_utc_when_requested
+  test_list_groups_profiles_with_refresh_errors_at_the_end
+  test_list_shows_refresh_issue_heading_when_all_profiles_have_errors
   test_refresh_without_args_prompts_and_lists_all_profiles
   test_refresh_cancel_shows_usage_instruction
   test_refresh_continues_after_profile_failures_and_summarizes

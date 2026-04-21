@@ -2,6 +2,11 @@
 
 Newest releases go at the top.
 
+## 0.7.0 - 2026-04-21
+
+- Persist the latest per-profile refresh failure in `usage.json` so `list` and `current` keep showing unresolved refresh problems until the next successful refresh clears them.
+- Group profiles with refresh problems at the end of `list`, separated by a rule, with the affected profile name and compact issue reason highlighted in red.
+
 ## 0.6.0 - 2026-04-21
 
 - Made local session statistics opt-in for `list` and post-refresh output via `--with-stats`, so ordinary profile listing and usage refreshes avoid parsing rollout history and pricing by default.
