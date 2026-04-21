@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.6.0 - 2026-04-21
+
+- Made local session statistics opt-in for `list` and post-refresh output via `--with-stats`, so ordinary profile listing and usage refreshes avoid parsing rollout history and pricing by default.
+- Added a parsed session-stats cache keyed by rollout file path, size, and mtime, plus `stats --recompute` to force a full rebuild when desired.
+- Increased the default OpenAI pricing cache TTL from one day to one week and documented the new stats/pricing cache behavior.
+
 ## 0.5.1 - 2026-04-12
 
 - Fixed session statistics pricing so older Codex models like `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.1-codex-mini`, and `gpt-5.1-codex-max` are read from the official single OpenAI pricing page instead of falling back to `gpt-5.4`.

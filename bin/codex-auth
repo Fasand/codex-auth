@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.5.1"
+APP_VERSION="0.6.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -14,7 +14,8 @@ FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_INSTALL_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
 DEFAULT_PRICING_URL="${CODEX_AUTH_PRICING_URL:-https://developers.openai.com/api/docs/pricing}"
 DEFAULT_PRICING_CACHE_PATH="${CODEX_AUTH_PRICING_CACHE_PATH:-$ACCOUNTS_DIR/pricing-cache.json}"
-DEFAULT_PRICING_CACHE_TTL_SECONDS="${CODEX_AUTH_PRICING_CACHE_TTL_SECONDS:-86400}"
+DEFAULT_PRICING_CACHE_TTL_SECONDS="${CODEX_AUTH_PRICING_CACHE_TTL_SECONDS:-604800}"
+DEFAULT_SESSION_STATS_CACHE_PATH="${CODEX_AUTH_SESSION_STATS_CACHE_PATH:-$ACCOUNTS_DIR/session-stats-cache.json}"
 export CODEX_AUTH_THEME_HEADER_STYLE="${CODEX_AUTH_THEME_HEADER_STYLE:-1;97}"
 export CODEX_AUTH_THEME_ACTIVE_STYLE="${CODEX_AUTH_THEME_ACTIVE_STYLE:-1;93}"
 export CODEX_AUTH_THEME_PROFILE_STYLE="${CODEX_AUTH_THEME_PROFILE_STYLE:-36}"
@@ -34,18 +35,19 @@ Usage: codex-auth <command> [args]
 Manage multiple ChatGPT Codex auth.json profiles.
 
 Commands:
-  list [--utc]              List saved profiles with account info and cached usage
+  list [--utc] [--with-stats]
+                            List saved profiles with account info and cached usage
   current [--utc]           Show the currently active auth profile or current auth summary
   save <name>               Save the current auth.json as a named profile
   switch [name]             Switch to a saved profile (interactive if name omitted)
   add <name>                Run codex login, then save the result as <name>
-  refresh-usage [--utc] [<name>|--all]
+  refresh-usage [--utc] [--with-stats] [<name>|--all]
                             Query live usage for one profile or, with no args, confirm refresh for all profiles
-  refresh [--utc] [<name>|--all]
+  refresh [--utc] [--with-stats] [<name>|--all]
                             Alias for refresh-usage
-  stats [--utc] [--period <today|7d|14d|30d|all>]
+  stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
                             Show global session token statistics from rollout history
-  statistics [--utc] [--period <today|7d|14d|30d|all>]
+  statistics [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
                             Alias for stats
   update                    Update this installed codex-auth via install.sh
   rename <old> <new>        Rename a saved profile
@@ -60,7 +62,8 @@ Environment:
   CODEX_AUTH_SESSIONS_DIR   Override sessions directory for session snapshot parsing
   CODEX_AUTH_PRICING_URL    Override pricing page URL for stats/cost estimation
   CODEX_AUTH_PRICING_CACHE_PATH  Override cached pricing file path
-  CODEX_AUTH_PRICING_CACHE_TTL_SECONDS  Override pricing cache TTL (default: 86400)
+  CODEX_AUTH_PRICING_CACHE_TTL_SECONDS  Override pricing cache TTL (default: 604800)
+  CODEX_AUTH_SESSION_STATS_CACHE_PATH  Override parsed session stats cache path
 USAGE
 }
 
@@ -891,7 +894,8 @@ render_session_stats() {
   local use_utc=${2:-0}
   local focus_period=${3:-30d}
   local daily_limit=${4:-31}
-  python3 - "$mode" "$SESSIONS_DIR" "$DEFAULT_PRICING_URL" "$DEFAULT_PRICING_CACHE_PATH" "$DEFAULT_PRICING_CACHE_TTL_SECONDS" "$use_utc" "$focus_period" "$daily_limit" <<'PY'
+  local force_recompute=${5:-0}
+  python3 - "$mode" "$SESSIONS_DIR" "$DEFAULT_PRICING_URL" "$DEFAULT_PRICING_CACHE_PATH" "$DEFAULT_PRICING_CACHE_TTL_SECONDS" "$use_utc" "$focus_period" "$daily_limit" "$DEFAULT_SESSION_STATS_CACHE_PATH" "$force_recompute" <<'PY'
 import datetime as dt
 import html
 import json
@@ -902,9 +906,11 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-mode, sessions_dir_arg, pricing_url, pricing_cache_path, pricing_ttl, use_utc, focus_period, daily_limit = sys.argv[1:9]
+mode, sessions_dir_arg, pricing_url, pricing_cache_path, pricing_ttl, use_utc, focus_period, daily_limit, session_stats_cache_path, force_recompute = sys.argv[1:11]
 sessions_dir = Path(sessions_dir_arg)
 cache_path = Path(pricing_cache_path)
+stats_cache_path = Path(session_stats_cache_path)
+force_recompute = force_recompute == '1'
 color_enabled = os.environ.get('CODEX_AUTH_FORCE_COLOR') == '1' or (
     not os.environ.get('NO_COLOR') and os.environ.get('TERM') != 'dumb' and sys.stdout.isatty()
 )
@@ -1092,52 +1098,151 @@ def get_pricing():
         return None, 'unavailable', str(exc)
 
 
+def cache_key(path):
+    try:
+        return path.relative_to(sessions_dir).as_posix()
+    except Exception:
+        return str(path)
+
+
+def load_session_stats_cache():
+    if force_recompute or not stats_cache_path.exists():
+        return {'entries': {}}
+    try:
+        cached = json.loads(stats_cache_path.read_text(encoding='utf-8'))
+    except Exception:
+        return {'entries': {}}
+    if cached.get('cache_schema_version') != 1:
+        return {'entries': {}}
+    cached_sessions_dir = cached.get('sessions_dir')
+    if cached_sessions_dir and cached_sessions_dir != str(sessions_dir):
+        return {'entries': {}}
+    entries = cached.get('entries')
+    if not isinstance(entries, dict):
+        return {'entries': {}}
+    return cached
+
+
+def write_session_stats_cache(entries):
+    try:
+        stats_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            'cache_schema_version': 1,
+            'generated_at': now_utc.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'sessions_dir': str(sessions_dir),
+            'entries': entries,
+        }
+        stats_cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def raw_event_to_runtime(raw):
+    ts = parse_dt(raw.get('timestamp'))
+    if ts is None:
+        return None
+    try:
+        input_tokens = int(raw.get('input_tokens') or 0)
+        cached_input_tokens = int(raw.get('cached_input_tokens') or 0)
+        output_tokens = int(raw.get('output_tokens') or 0)
+        reasoning_output_tokens = int(raw.get('reasoning_output_tokens') or 0)
+        total_tokens_raw = raw.get('total_tokens')
+        total_tokens = int(total_tokens_raw) if total_tokens_raw not in (None, '') else input_tokens + output_tokens
+    except Exception:
+        return None
+    return {
+        'timestamp': ts,
+        'local_date': ts.astimezone(local_tz).date().isoformat(),
+        'session_id': str(raw.get('session_id') or ''),
+        'model': normalize_model(raw.get('model')),
+        'input_tokens': input_tokens,
+        'cached_input_tokens': cached_input_tokens,
+        'output_tokens': output_tokens,
+        'reasoning_output_tokens': reasoning_output_tokens,
+        'total_tokens': total_tokens,
+    }
+
+
+def parse_events_from_path(path):
+    raw_events = []
+    current_model = None
+    session_id = str(path)
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except Exception:
+        return raw_events
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        payload = obj.get('payload') if isinstance(obj.get('payload'), dict) else {}
+        if obj.get('type') == 'session_meta':
+            session_id = payload.get('id') or session_id
+        elif obj.get('type') == 'turn_context':
+            current_model = normalize_model(payload.get('model')) or current_model
+        elif obj.get('type') == 'event_msg' and payload.get('type') == 'token_count':
+            info = payload.get('info') or {}
+            usage = info.get('last_token_usage') or {}
+            if not usage:
+                continue
+            ts = parse_dt(obj.get('timestamp'))
+            if ts is None:
+                continue
+            input_tokens = int(usage.get('input_tokens') or 0)
+            cached_input_tokens = int(usage.get('cached_input_tokens') or 0)
+            output_tokens = int(usage.get('output_tokens') or 0)
+            reasoning_output_tokens = int(usage.get('reasoning_output_tokens') or 0)
+            total_tokens = usage.get('total_tokens')
+            total_tokens = int(total_tokens) if total_tokens not in (None, '') else input_tokens + output_tokens
+            raw_events.append({
+                'timestamp': ts.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'session_id': session_id,
+                'model': current_model,
+                'input_tokens': input_tokens,
+                'cached_input_tokens': cached_input_tokens,
+                'output_tokens': output_tokens,
+                'reasoning_output_tokens': reasoning_output_tokens,
+                'total_tokens': total_tokens,
+            })
+    return raw_events
+
+
+cache_stats = {'reused_files': 0, 'parsed_files': 0, 'path': str(stats_cache_path), 'forced': force_recompute}
+
+
 def iter_events():
     if not sessions_dir.exists():
         return []
+    cache = load_session_stats_cache()
+    cached_entries = cache.get('entries', {})
+    next_entries = {}
     events = []
     for path in sorted(sessions_dir.glob('**/rollout-*.jsonl')):
-        current_model = None
-        session_id = str(path)
         try:
-            lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+            stat = path.stat()
         except Exception:
             continue
-        for line in lines:
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            payload = obj.get('payload') if isinstance(obj.get('payload'), dict) else {}
-            if obj.get('type') == 'session_meta':
-                session_id = payload.get('id') or session_id
-            elif obj.get('type') == 'turn_context':
-                current_model = normalize_model(payload.get('model')) or current_model
-            elif obj.get('type') == 'event_msg' and payload.get('type') == 'token_count':
-                info = payload.get('info') or {}
-                usage = info.get('last_token_usage') or {}
-                if not usage:
-                    continue
-                ts = parse_dt(obj.get('timestamp'))
-                if ts is None:
-                    continue
-                input_tokens = int(usage.get('input_tokens') or 0)
-                cached_input_tokens = int(usage.get('cached_input_tokens') or 0)
-                output_tokens = int(usage.get('output_tokens') or 0)
-                reasoning_output_tokens = int(usage.get('reasoning_output_tokens') or 0)
-                total_tokens = usage.get('total_tokens')
-                total_tokens = int(total_tokens) if total_tokens not in (None, '') else input_tokens + output_tokens
-                events.append({
-                    'timestamp': ts,
-                    'local_date': ts.astimezone(local_tz).date().isoformat(),
-                    'session_id': session_id,
-                    'model': current_model,
-                    'input_tokens': input_tokens,
-                    'cached_input_tokens': cached_input_tokens,
-                    'output_tokens': output_tokens,
-                    'reasoning_output_tokens': reasoning_output_tokens,
-                    'total_tokens': total_tokens,
-                })
+        key = cache_key(path)
+        entry = cached_entries.get(key) if isinstance(cached_entries, dict) else None
+        raw_events = None
+        if not force_recompute and isinstance(entry, dict) and entry.get('size') == stat.st_size and entry.get('mtime_ns') == stat.st_mtime_ns and isinstance(entry.get('events'), list):
+            raw_events = entry.get('events') or []
+            cache_stats['reused_files'] += 1
+        else:
+            raw_events = parse_events_from_path(path)
+            cache_stats['parsed_files'] += 1
+        next_entries[key] = {
+            'size': stat.st_size,
+            'mtime_ns': stat.st_mtime_ns,
+            'events': raw_events,
+        }
+        for raw in raw_events:
+            event = raw_event_to_runtime(raw)
+            if event is not None:
+                events.append(event)
+    if force_recompute or cache_stats['parsed_files'] > 0 or set(next_entries.keys()) != set(cached_entries.keys()):
+        write_session_stats_cache(next_entries)
     return events
 
 
@@ -1423,6 +1528,7 @@ if pricing:
     notes.append(f"Cost coverage: {pct(focus_summary['exact_tokens'], focus_summary['total_tokens'])} exact-model, {pct(focus_summary['fallback_tokens'], focus_summary['total_tokens'])} fallback-model")
 else:
     notes.append(f"Pricing unavailable: {pricing_error or 'no pricing cache and live fetch failed'}")
+notes.append(f"Stats cache: reused {cache_stats['reused_files']} rollout files, parsed {cache_stats['parsed_files']} rollout files{' (forced)' if cache_stats['forced'] else ''}; {cache_stats['path']}")
 notes.append('Cost methodology: (input tokens - cached input tokens) × input rate + cached input tokens × cached-input rate + output tokens × output rate.')
 notes.append('Cached input is included within input tokens.')
 notes.append('Reasoning output is shown separately for visibility but is not charged again, because it is already included within output tokens in the session logs.')
@@ -1436,19 +1542,24 @@ PY
 stats_command() {
   local focus_period=30d
   local use_utc=0
+  local force_recompute=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --utc)
-        [[ $use_utc -eq 0 ]] || die "Usage: codex-auth stats [--utc] [--period <today|7d|14d|30d|all>]"
+        [[ $use_utc -eq 0 ]] || die "Usage: codex-auth stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
         use_utc=1
+        ;;
+      --recompute)
+        [[ $force_recompute -eq 0 ]] || die "Usage: codex-auth stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
+        force_recompute=1
         ;;
       --period)
         shift
-        [[ $# -gt 0 ]] || die "Usage: codex-auth stats [--utc] [--period <today|7d|14d|30d|all>]"
+        [[ $# -gt 0 ]] || die "Usage: codex-auth stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
         focus_period=$1
         ;;
       *)
-        die "Usage: codex-auth stats [--utc] [--period <today|7d|14d|30d|all>]"
+        die "Usage: codex-auth stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
         ;;
     esac
     shift
@@ -1457,10 +1568,10 @@ stats_command() {
     today|7d|14d|30d|all)
       ;;
     *)
-      die "Usage: codex-auth stats [--utc] [--period <today|7d|14d|30d|all>]"
+      die "Usage: codex-auth stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
       ;;
   esac
-  render_session_stats stats "$use_utc" "$focus_period" 31
+  render_session_stats stats "$use_utc" "$focus_period" 31 "$force_recompute"
 }
 
 save_profile() {
@@ -1483,6 +1594,7 @@ save_profile() {
 list_profiles() {
   ensure_dirs
   local use_utc=${1:-0}
+  local include_stats=${2:-0}
   local active_name names_found=0 name payload_file
   active_name=$(find_matching_profile || true)
   payload_file=$(mktemp)
@@ -1493,7 +1605,9 @@ list_profiles() {
   done < <(list_profile_names)
   if [[ $names_found -eq 1 ]]; then
     render_profile_table "$payload_file"
-    render_session_stats footer "$use_utc" 30d 31 || true
+    if [[ $include_stats -eq 1 ]]; then
+      render_session_stats footer "$use_utc" 30d 31 0 || true
+    fi
   else
     note "No saved profiles in $PROFILES_DIR"
   fi
@@ -1754,6 +1868,7 @@ refresh_usage_command() {
   ensure_dirs
   local target=${1:-}
   local use_utc=${2:-0}
+  local include_stats=${3:-0}
   local confirm_status=0
   local name error
   local index=0 total=0 failure_count=0
@@ -1787,7 +1902,7 @@ refresh_usage_command() {
   done
 
   refresh_progress_clear
-  list_profiles "$use_utc"
+  list_profiles "$use_utc" "$include_stats"
 
   if (( failure_count > 0 )); then
     if (( failure_count == 1 )); then
@@ -1879,18 +1994,25 @@ main() {
       ;;
     list)
       shift
-      case "${1:-}" in
-        "")
-          list_profiles 0
-          ;;
-        --utc)
-          [[ $# -eq 1 ]] || die "Usage: codex-auth list [--utc]"
-          list_profiles 1
-          ;;
-        *)
-          die "Usage: codex-auth list [--utc]"
-          ;;
-      esac
+      local list_use_utc=0
+      local list_include_stats=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --utc)
+            [[ $list_use_utc -eq 0 ]] || die "Usage: codex-auth list [--utc] [--with-stats]"
+            list_use_utc=1
+            ;;
+          --with-stats)
+            [[ $list_include_stats -eq 0 ]] || die "Usage: codex-auth list [--utc] [--with-stats]"
+            list_include_stats=1
+            ;;
+          *)
+            die "Usage: codex-auth list [--utc] [--with-stats]"
+            ;;
+        esac
+        shift
+      done
+      list_profiles "$list_use_utc" "$list_include_stats"
       ;;
     current)
       shift
@@ -1930,27 +2052,32 @@ main() {
       shift
       local refresh_target=""
       local refresh_use_utc=0
+      local refresh_include_stats=0
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --utc)
-            [[ $refresh_use_utc -eq 0 ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            [[ $refresh_use_utc -eq 0 ]] || die "Usage: codex-auth refresh-usage [--utc] [--with-stats] [<name>|--all]"
             refresh_use_utc=1
             ;;
+          --with-stats)
+            [[ $refresh_include_stats -eq 0 ]] || die "Usage: codex-auth refresh-usage [--utc] [--with-stats] [<name>|--all]"
+            refresh_include_stats=1
+            ;;
           --all)
-            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [--with-stats] [<name>|--all]"
             refresh_target="--all"
             ;;
           -*)
-            die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            die "Usage: codex-auth refresh-usage [--utc] [--with-stats] [<name>|--all]"
             ;;
           *)
-            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [<name>|--all]"
+            [[ -z "$refresh_target" ]] || die "Usage: codex-auth refresh-usage [--utc] [--with-stats] [<name>|--all]"
             refresh_target="$1"
             ;;
         esac
         shift
       done
-      refresh_usage_command "$refresh_target" "$refresh_use_utc"
+      refresh_usage_command "$refresh_target" "$refresh_use_utc" "$refresh_include_stats"
       ;;
     update)
       shift
