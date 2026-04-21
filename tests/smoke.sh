@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.5.1"
+EXPECTED_VERSION="0.6.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -216,16 +216,16 @@ test_help_mentions_update_command() {
   local output
   output=$(bash "$ROOT_DIR/bin/codex-auth" help)
   assert_contains "$output" "update"
-  assert_contains "$output" "stats [--utc] [--period <today|7d|14d|30d|all>]"
-  assert_contains "$output" "statistics [--utc] [--period <today|7d|14d|30d|all>]"
+  assert_contains "$output" "stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
+  assert_contains "$output" "statistics [--utc] [--recompute] [--period <today|7d|14d|30d|all>]"
 }
 
 test_help_mentions_refresh_alias_and_utc_flag() {
   local output
   output=$(bash "$ROOT_DIR/bin/codex-auth" help)
-  assert_contains "$output" "refresh-usage [--utc] [<name>|--all]"
-  assert_contains "$output" "refresh [--utc] [<name>|--all]"
-  assert_contains "$output" "list [--utc]"
+  assert_contains "$output" "refresh-usage [--utc] [--with-stats] [<name>|--all]"
+  assert_contains "$output" "refresh [--utc] [--with-stats] [<name>|--all]"
+  assert_contains "$output" "list [--utc] [--with-stats]"
   assert_contains "$output" "current [--utc]"
 }
 
@@ -301,7 +301,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-04-12"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-04-21"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
@@ -324,6 +324,8 @@ test_completion_lists_update_command() {
   assert_contains "$completion" "statistics"
   assert_contains "$completion" "--utc"
   assert_contains "$completion" "--period"
+  assert_contains "$completion" "--with-stats"
+  assert_contains "$completion" "--recompute"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -425,6 +427,7 @@ test_refresh_without_args_prompts_and_lists_all_profiles() {
   assert_contains "$output" "beta"
   assert_contains "$output" "84%"
   assert_contains "$output" "61%"
+  assert_not_contains "$output" "Session usage:"
   [[ -f "$home_dir/accounts/profiles/alpha/usage.json" ]] || fail "expected alpha usage.json to be written"
   [[ -f "$home_dir/accounts/profiles/beta/usage.json" ]] || fail "expected beta usage.json to be written"
 
@@ -481,10 +484,11 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
   trap - RETURN
 }
 
-test_list_shows_compact_session_usage_footer() {
-  local home_dir pricing_file output
+test_list_skips_session_stats_by_default_and_with_stats_opts_in() {
+  local home_dir pricing_file pricing_cache output stats_output
   home_dir=$(mktemp -d)
   pricing_file=$(mktemp)
+  pricing_cache="$home_dir/accounts/pricing-cache.json"
   create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
   write_usage_fixture "$home_dir" "demo" 88 1774656360 77 1774829160
   write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
@@ -492,11 +496,40 @@ test_list_shows_compact_session_usage_footer() {
   write_pricing_fixture "$pricing_file"
 
   output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "demo"
+  assert_not_contains "$output" "Session usage:"
+  [[ ! -f "$pricing_cache" ]] || fail "expected default list to avoid creating pricing cache"
+
+  stats_output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" list --with-stats)
+  assert_contains "$stats_output" "Session usage: today 1 session"
+  assert_contains "$stats_output" '$0.0036 API-eq'
+  assert_contains "$stats_output" "1.1k tokens"
+  assert_contains "$stats_output" "Session usage: 7d    2 sessions"
+  assert_contains "$stats_output" '$0.0091 API-eq'
+}
+
+test_refresh_with_stats_flag_includes_session_footer() {
+  local home_dir port_file server_pid output usage_url pricing_file
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
+  write_pricing_fixture "$pricing_file"
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-usage --all --with-stats 2>&1)
+  assert_contains "$output" "Refreshed alpha"
   assert_contains "$output" "Session usage: today 1 session"
   assert_contains "$output" '$0.0036 API-eq'
-  assert_contains "$output" "1.1k tokens"
-  assert_contains "$output" "Session usage: 7d    2 sessions"
-  assert_contains "$output" '$0.0091 API-eq'
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
 }
 
 test_stats_reports_overview_daily_and_model_breakdown() {
@@ -589,6 +622,85 @@ test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page() {
   assert_not_contains "$output" 'gpt-5.1-codex-max → gpt-5.4'
 }
 
+test_default_pricing_cache_ttl_keeps_week_old_prices_fresh() {
+  local home_dir pricing_file cache_file output
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  cache_file="$home_dir/accounts/pricing-cache.json"
+  mkdir -p "$home_dir/accounts"
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture_multi_section "$pricing_file"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-53" "2026-04-12T08:07:00Z" "gpt-5.3-codex" 1000000 0 0 0 1000000
+  cat > "$cache_file" <<'JSON'
+{
+  "cache_schema_version": 3,
+  "tier": "standard",
+  "fetched_at": "2026-04-06T12:00:00Z",
+  "fallback_model": "gpt-5.4",
+  "models": {
+    "gpt-5.4": {
+      "input": 2.5,
+      "cached_input": 0.25,
+      "output": 15
+    }
+  }
+}
+JSON
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" 'gpt-5.3-codex → gpt-5.4'
+  assert_contains "$output" 'status: fresh-cache'
+}
+
+test_stats_reuses_session_cache_and_recompute_bypasses_it() {
+  local home_dir pricing_file cache_file output recompute_output rollout_file
+  home_dir=$(mktemp -d)
+  pricing_file=$(mktemp)
+  cache_file="$home_dir/accounts/session-stats-cache.json"
+  create_profile_fixture "$home_dir" "demo" "demo@example.com" "acct_demo"
+  write_pricing_fixture "$pricing_file"
+  write_rollout_fixture "$home_dir" "2026/04/12" "rollout-a" "2026-04-12T08:05:00Z" "gpt-5.4" 1000 200 100 40 1100
+  rollout_file="$home_dir/sessions/2026/04/12/rollout-a.jsonl"
+  mkdir -p "$home_dir/accounts"
+  python3 - "$rollout_file" "$cache_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+rollout_file = Path(sys.argv[1])
+cache_file = Path(sys.argv[2])
+stat = rollout_file.stat()
+cache = {
+    "cache_schema_version": 1,
+    "sessions_dir": str(rollout_file.parents[3]),
+    "entries": {
+        "2026/04/12/rollout-a.jsonl": {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "events": [{
+                "timestamp": "2026-04-12T08:05:00Z",
+                "session_id": "rollout-a",
+                "model": "gpt-5.4",
+                "input_tokens": 9000,
+                "cached_input_tokens": 0,
+                "output_tokens": 900,
+                "reasoning_output_tokens": 90,
+                "total_tokens": 9900
+            }]
+        }
+    }
+}
+cache_file.write_text(json.dumps(cache), encoding="utf-8")
+PY
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today)
+  assert_contains "$output" "9.9k"
+  assert_contains "$output" "Stats cache:"
+
+  recompute_output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_PRICING_URL="file://$pricing_file" CODEX_AUTH_NOW="2026-04-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" stats --period today --recompute)
+  assert_contains "$recompute_output" "1.1k"
+  assert_not_contains "$recompute_output" "9.9k"
+}
+
 test_stats_invalidates_old_pricing_cache_schema() {
   local home_dir pricing_file cache_file output
   home_dir=$(mktemp -d)
@@ -637,11 +749,14 @@ main() {
   test_refresh_without_args_prompts_and_lists_all_profiles
   test_refresh_cancel_shows_usage_instruction
   test_refresh_continues_after_profile_failures_and_summarizes
-  test_list_shows_compact_session_usage_footer
+  test_list_skips_session_stats_by_default_and_with_stats_opts_in
+  test_refresh_with_stats_flag_includes_session_footer
   test_stats_reports_overview_daily_and_model_breakdown
   test_statistics_alias_and_all_period_cap_daily_rows
   test_stats_uses_standard_pricing_tier_and_explains_cost_methodology
   test_stats_uses_exact_pricing_for_models_found_later_on_the_pricing_page
+  test_default_pricing_cache_ttl_keeps_week_old_prices_fresh
+  test_stats_reuses_session_cache_and_recompute_bypasses_it
   test_stats_invalidates_old_pricing_cache_schema
   test_workflow_uses_node24_ready_checkout
   test_install_script_avoids_unsafe_array_expansion_in_dependency_report

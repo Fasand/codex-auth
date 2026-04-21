@@ -25,16 +25,20 @@ _codex_auth_completion() {
       COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
       return 0
       ;;
-    list|current)
+    list)
+      COMPREPLY=( $(compgen -W "--utc --with-stats" -- "$cur") )
+      return 0
+      ;;
+    current)
       COMPREPLY=( $(compgen -W "--utc" -- "$cur") )
       return 0
       ;;
     refresh-usage|refresh)
-      COMPREPLY=( $(compgen -W "--all --utc $profiles" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--all --utc --with-stats $profiles" -- "$cur") )
       return 0
       ;;
     stats|statistics)
-      COMPREPLY=( $(compgen -W "--utc --period" -- "$cur") )
+      COMPREPLY=( $(compgen -W "--utc --period --recompute" -- "$cur") )
       return 0
       ;;
     --period)
@@ -45,11 +49,31 @@ _codex_auth_completion() {
       ;;
     --utc)
       if [[ "$first" == "refresh-usage" || "$first" == "refresh" ]]; then
-        COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--all --with-stats --utc $profiles" -- "$cur") )
+        return 0
+      fi
+      if [[ "$first" == "list" ]]; then
+        COMPREPLY=( $(compgen -W "--utc --with-stats" -- "$cur") )
         return 0
       fi
       if [[ "$first" == "stats" || "$first" == "statistics" ]]; then
-        COMPREPLY=( $(compgen -W "--period" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--period --recompute --utc" -- "$cur") )
+        return 0
+      fi
+      ;;
+    --with-stats)
+      if [[ "$first" == "refresh-usage" || "$first" == "refresh" ]]; then
+        COMPREPLY=( $(compgen -W "--all --with-stats --utc $profiles" -- "$cur") )
+        return 0
+      fi
+      if [[ "$first" == "list" ]]; then
+        COMPREPLY=( $(compgen -W "--utc --with-stats" -- "$cur") )
+        return 0
+      fi
+      ;;
+    --recompute)
+      if [[ "$first" == "stats" || "$first" == "statistics" ]]; then
+        COMPREPLY=( $(compgen -W "--period --recompute --utc" -- "$cur") )
         return 0
       fi
       ;;
