@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.8.0"
+APP_VERSION="0.9.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -9,6 +9,10 @@ ACCOUNTS_DIR="$CODEX_HOME/accounts"
 PROFILES_DIR="$ACCOUNTS_DIR/profiles"
 CURRENT_PROFILE_FILE="$ACCOUNTS_DIR/current_profile"
 SESSIONS_DIR="${CODEX_AUTH_SESSIONS_DIR:-$CODEX_HOME/sessions}"
+CRON_DIR="$ACCOUNTS_DIR/cron"
+CRON_LOG_FILE="${CODEX_AUTH_CRON_LOG_FILE:-$CRON_DIR/touch.log}"
+CODEX_AUTH_CODEX_BIN="${CODEX_AUTH_CODEX_BIN:-codex}"
+DEFAULT_CRON_BASE_PATH="/usr/local/bin:/usr/bin:/bin"
 DEFAULT_USAGE_URL="https://chatgpt.com/backend-api/codex/usage"
 FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
 DEFAULT_INSTALL_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
@@ -50,6 +54,8 @@ Commands:
                             Show saved ID/access token expiry metadata
                             Defaults to all profiles when no name is provided
   touch <name>|--all        Run a minimal Codex request for profile(s), save live auth, and report whether tokens rotated
+  cron [list|setup|add|delete|run]
+                            Manage scheduled touch cron jobs
   stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
                             Show global session token statistics from rollout history
   statistics [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
@@ -69,6 +75,10 @@ Environment:
   CODEX_AUTH_PRICING_CACHE_PATH  Override cached pricing file path
   CODEX_AUTH_PRICING_CACHE_TTL_SECONDS  Override pricing cache TTL (default: 604800)
   CODEX_AUTH_SESSION_STATS_CACHE_PATH  Override parsed session stats cache path
+  CODEX_AUTH_CODEX_BIN    Override codex executable used by touch/cron
+  CODEX_AUTH_CRON_LOG_FILE  Override scheduled touch log path
+  CODEX_AUTH_CRON_PATH    Override PATH used by generated cron commands
+  CODEX_AUTH_DISABLE_WHIPTAIL  Set to 1 to force numbered cron setup prompts
 USAGE
 }
 
@@ -98,6 +108,26 @@ color_output_enabled() {
   [[ -n "${NO_COLOR:-}" ]] && return 1
   [[ "${TERM:-}" == "dumb" ]] && return 1
   [[ -t 1 ]]
+}
+
+style_color_enabled() {
+  [[ "${CODEX_AUTH_FORCE_COLOR:-0}" == "1" ]] && return 0
+  [[ -n "${NO_COLOR:-}" ]] && return 1
+  [[ "${TERM:-}" == "dumb" ]] && return 1
+  [[ -t 1 || -t 2 ]]
+}
+
+style_text() {
+  local style_name=$1
+  local text=$2
+  if style_color_enabled; then
+    local style=${!style_name-}
+    if [[ -n "$style" ]]; then
+      printf '\033[%sm%s\033[0m' "$style" "$text"
+      return 0
+    fi
+  fi
+  printf '%s' "$text"
 }
 
 ensure_dirs() {
@@ -2282,7 +2312,7 @@ touch_one_profile() {
   switch_profile "$profile_name" >/dev/null 2>&1
   tmp_dir=$(mktemp -d)
   codex_output=$(mktemp)
-  if codex exec \
+  if "$CODEX_AUTH_CODEX_BIN" exec \
     --ephemeral \
     --ignore-user-config \
     --ignore-rules \
@@ -2321,7 +2351,7 @@ touch_command() {
   for name in "${targets[@]}"; do
     [[ -f "$(profile_auth_path "$name")" ]] || die "Profile '$name' is missing auth.json"
   done
-  require_cmd codex
+  require_cmd "$CODEX_AUTH_CODEX_BIN"
 
   local touch_lock_dir="$ACCOUNTS_DIR/touch.lock"
   if ! mkdir "$touch_lock_dir" 2>/dev/null; then
@@ -2392,6 +2422,1027 @@ if not resolved:
 
 print(os.path.realpath(resolved))
 PY
+}
+
+shell_quote() {
+  python3 - "$1" <<'PY'
+import shlex
+import sys
+
+print(shlex.quote(sys.argv[1]))
+PY
+}
+
+cron_usage() {
+  cat <<USAGE
+Usage: codex-auth cron [list|setup|add|delete|run]
+
+Manage scheduled codex-auth touch cron jobs.
+
+Commands:
+  cron                         List codex-auth-managed touch cron jobs
+  cron list                    List codex-auth-managed touch cron jobs
+  cron setup                   Interactive wizard to create a touch cron job
+  cron add [options]           Add a touch cron job non-interactively
+  cron delete [<job-id>|--all] [--yes]
+                               Delete managed touch cron job(s)
+  cron run <job-id> <profile|--all>
+                               Internal cron runner with timestamped output
+
+Add options:
+  --time HH:MM                 24-hour time for daily schedules
+  --daily                      Run every day (default)
+  --schedule "M H DOM MON DOW" Use a custom five-field cron schedule
+  --all                        Touch all profiles (default)
+  --profile <name>             Touch one saved profile
+  --id <job-id>                Use an explicit managed job id
+  --yes, -y                    Skip confirmation
+USAGE
+}
+
+cron_read_current() {
+  if [[ -n "${CODEX_AUTH_CRONTAB_FILE:-}" ]]; then
+    [[ -f "$CODEX_AUTH_CRONTAB_FILE" ]] && cat "$CODEX_AUTH_CRONTAB_FILE"
+    return 0
+  fi
+
+  require_cmd crontab
+  local out_file err_file status=0
+  out_file=$(mktemp)
+  err_file=$(mktemp)
+  if crontab -l >"$out_file" 2>"$err_file"; then
+    cat "$out_file"
+  else
+    status=$?
+    if grep -qi 'no crontab' "$err_file" || { [[ ! -s "$out_file" ]] && [[ ! -s "$err_file" ]]; }; then
+      :
+    else
+      cat "$err_file" >&2
+      rm -f "$out_file" "$err_file"
+      return "$status"
+    fi
+  fi
+  rm -f "$out_file" "$err_file"
+}
+
+cron_install_file() {
+  local source_file=$1
+  if [[ -n "${CODEX_AUTH_CRONTAB_FILE:-}" ]]; then
+    cp "$source_file" "$CODEX_AUTH_CRONTAB_FILE"
+    return 0
+  fi
+  require_cmd crontab
+  crontab "$source_file"
+}
+
+cron_with_lock() {
+  ensure_dirs
+  local lock_dir="$ACCOUNTS_DIR/cron.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "Another codex-auth cron operation is already running (lock: $lock_dir)"
+  fi
+  local status=0
+  set +e
+  ( set -e; "$@" )
+  status=$?
+  set -e
+  rm -rf "$lock_dir"
+  return "$status"
+}
+
+cron_jobs_json_from_file() {
+  local crontab_file=$1
+  python3 - "$crontab_file" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+jobs = []
+current = None
+
+for line in lines:
+    begin = re.match(r'^# BEGIN codex-auth touch ([A-Za-z0-9._-]+)\s*$', line)
+    if begin:
+        current = {
+            'id': begin.group(1),
+            'schedule': '',
+            'target': '',
+            'log': '',
+            'cron': '',
+            'command': '',
+        }
+        continue
+
+    if current is None:
+        continue
+
+    end = re.match(r'^# END codex-auth touch ([A-Za-z0-9._-]+)\s*$', line)
+    if end:
+        if end.group(1) == current['id']:
+            jobs.append(current)
+        current = None
+        continue
+
+    stripped = line.strip()
+    if stripped.startswith('# schedule:'):
+        current['schedule'] = stripped.split(':', 1)[1].strip()
+    elif stripped.startswith('# target:'):
+        current['target'] = stripped.split(':', 1)[1].strip()
+    elif stripped.startswith('# log:'):
+        current['log'] = stripped.split(':', 1)[1].strip()
+    elif stripped and not stripped.startswith('#'):
+        parts = stripped.split(None, 5)
+        if len(parts) >= 6:
+            current['cron'] = ' '.join(parts[:5])
+            current['command'] = parts[5]
+
+for job in jobs:
+    print(json.dumps(job, separators=(',', ':')))
+PY
+}
+
+render_cron_jobs_table() {
+  local jobs_file=$1
+  local color_enabled=0
+  if color_output_enabled; then
+    color_enabled=1
+  fi
+
+  python3 - "$jobs_file" "$color_enabled" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+rows = []
+for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    line = line.strip()
+    if line:
+        rows.append(json.loads(line))
+
+color_enabled = sys.argv[2] == '1'
+
+
+def paint(text, style_name):
+    if not text or not color_enabled:
+        return text
+    style = os.environ.get(style_name, '')
+    return f"\033[{style}m{text}\033[0m" if style else text
+
+
+if not rows:
+    print("No codex-auth touch cron jobs found.")
+    print("Run: codex-auth cron setup")
+    raise SystemExit(0)
+
+print(paint("CODEX-AUTH TOUCH CRON JOBS", 'CODEX_AUTH_THEME_HEADER_STYLE'))
+headers = ['ID', 'SCHEDULE', 'TARGET', 'CRON', 'LOG']
+display_rows = []
+for row in rows:
+    target = row.get('target') or ''
+    if target == '--all':
+        target = 'all profiles'
+    display_rows.append([
+        row.get('id') or '',
+        row.get('schedule') or '',
+        target,
+        row.get('cron') or '',
+        row.get('log') or '',
+    ])
+
+widths = []
+for index, header in enumerate(headers):
+    widths.append(max([len(header)] + [len(row[index]) for row in display_rows]))
+
+
+def pad(value, width):
+    return (value or '').ljust(width)
+
+
+header_line = '  '.join(paint(pad(header, width), 'CODEX_AUTH_THEME_HEADER_STYLE') for header, width in zip(headers, widths))
+print(header_line)
+for row in display_rows:
+    cells = [
+        paint(pad(row[0], widths[0]), 'CODEX_AUTH_THEME_PROFILE_STYLE'),
+        paint(pad(row[1], widths[1]), 'CODEX_AUTH_THEME_RESET_STYLE'),
+        pad(row[2], widths[2]),
+        pad(row[3], widths[3]),
+        paint(pad(row[4], widths[4]), 'CODEX_AUTH_THEME_DIM_STYLE'),
+    ]
+    print('  '.join(cells))
+PY
+}
+
+cron_list_command() {
+  local crontab_file jobs_file
+  crontab_file=$(mktemp)
+  jobs_file=$(mktemp)
+  cron_read_current > "$crontab_file"
+  cron_jobs_json_from_file "$crontab_file" > "$jobs_file"
+  render_cron_jobs_table "$jobs_file"
+  rm -f "$crontab_file" "$jobs_file"
+}
+
+cron_job_tsv_from_file() {
+  local crontab_file=$1
+  local jobs_file
+  jobs_file=$(mktemp)
+  cron_jobs_json_from_file "$crontab_file" > "$jobs_file"
+  python3 - "$jobs_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+print("ID\t  ID                         SCHEDULE                  TARGET")
+for line in Path(sys.argv[1]).read_text(encoding='utf-8').splitlines():
+    if not line.strip():
+        continue
+    job = json.loads(line)
+    target = 'all profiles' if job.get('target') == '--all' else job.get('target', '')
+    display = f"  {job.get('id',''):<26} {job.get('schedule',''):<25} {target}"
+    print(f"{job.get('id','')}\t{display}")
+PY
+  rm -f "$jobs_file"
+}
+
+cron_has_job_id() {
+  local crontab_file=$1
+  local job_id=$2
+  grep -Fxq "# BEGIN codex-auth touch $job_id" "$crontab_file"
+}
+
+cron_slug() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+text = sys.argv[1].strip().lower()
+text = re.sub(r'[^a-z0-9._-]+', '-', text)
+text = text.strip('-')
+print(text or 'job')
+PY
+}
+
+validate_cron_job_id() {
+  local job_id=${1:-}
+  [[ -n "$job_id" ]] || die "Cron job id is required"
+  [[ "$job_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "Invalid cron job id '$job_id' (allowed: letters, numbers, dot, underscore, hyphen)"
+}
+
+validate_cron_time() {
+  local time_value=${1:-}
+  [[ "$time_value" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Invalid time '$time_value' (expected HH:MM, 24-hour)"
+}
+
+validate_cron_expression() {
+  local expression=${1:-}
+  python3 - "$expression" <<'PY'
+import sys
+
+parts = sys.argv[1].split()
+if len(parts) != 5:
+    raise SystemExit(1)
+if any(part.strip() == '' for part in parts):
+    raise SystemExit(1)
+PY
+}
+
+cron_expr_from_time() {
+  local schedule_type=$1
+  local time_value=$2
+  validate_cron_time "$time_value"
+  local hour minute
+  hour=${time_value%:*}
+  minute=${time_value#*:}
+  # Strip leading zeroes for readability; force decimal with 10#.
+  hour=$((10#$hour))
+  minute=$((10#$minute))
+  case "$schedule_type" in
+    daily)
+      printf '%s %s * * *\n' "$minute" "$hour"
+      ;;
+    *)
+      die "Unknown cron schedule type '$schedule_type'"
+      ;;
+  esac
+}
+
+cron_schedule_description() {
+  local schedule_type=$1
+  local time_value=${2:-}
+  local expression=${3:-}
+  case "$schedule_type" in
+    daily)
+      printf 'daily at %s\n' "$time_value"
+      ;;
+    custom)
+      printf 'custom: %s\n' "$expression"
+      ;;
+    *)
+      die "Unknown cron schedule type '$schedule_type'"
+      ;;
+  esac
+}
+
+cron_default_job_id_base() {
+  local schedule_type=$1
+  local time_value=${2:-}
+  local target=$3
+  local target_slug
+  if [[ "$target" == "--all" ]]; then
+    target_slug="all"
+  else
+    target_slug=$(cron_slug "$target")
+  fi
+  case "$schedule_type" in
+    daily)
+      printf '%s-%s-%s\n' "$schedule_type" "${time_value/:/}" "$target_slug"
+      ;;
+    custom)
+      printf 'custom-%s\n' "$target_slug"
+      ;;
+    *)
+      die "Unknown cron schedule type '$schedule_type'"
+      ;;
+  esac
+}
+
+cron_unique_job_id() {
+  local crontab_file=$1
+  local base_id=$2
+  local candidate=$base_id
+  local suffix=2
+  while cron_has_job_id "$crontab_file" "$candidate"; do
+    candidate="${base_id}-${suffix}"
+    suffix=$((suffix + 1))
+  done
+  printf '%s\n' "$candidate"
+}
+
+cron_validate_target() {
+  local target=$1
+  if [[ "$target" == "--all" ]]; then
+    local count
+    count=$(list_profile_names | wc -l | tr -d ' ')
+    (( count > 0 )) || die "No saved profiles available; save a profile first"
+    return 0
+  fi
+  validate_profile_name "$target"
+  [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+}
+
+cron_touch_command_label() {
+  local target=$1
+  if [[ "$target" == "--all" ]]; then
+    printf 'codex-auth touch --all\n'
+  else
+    printf 'codex-auth touch %s\n' "$target"
+  fi
+}
+
+cron_resolve_codex_bin() {
+  local resolved
+  resolved=$(command -v "$CODEX_AUTH_CODEX_BIN" 2>/dev/null || true)
+  [[ -n "$resolved" ]] || die "Required command not found: $CODEX_AUTH_CODEX_BIN"
+  python3 - "$resolved" <<'PY'
+import os
+import sys
+
+print(os.path.abspath(sys.argv[1]))
+PY
+}
+
+cron_runner_command() {
+  local job_id=$1
+  local target=$2
+  local script_path codex_bin codex_dir codex_name cron_path command_parts=()
+  script_path=$(resolve_current_executable_path "${BASH_SOURCE[0]:-$0}") || die "Unable to resolve the current executable path"
+  codex_bin=$(cron_resolve_codex_bin)
+  codex_dir=$(CDPATH= cd -- "$(dirname -- "$codex_bin")" && pwd -P)
+  codex_name=$(basename -- "$codex_bin")
+  cron_path="${CODEX_AUTH_CRON_PATH:-$codex_dir:$DEFAULT_CRON_BASE_PATH}"
+
+  if [[ "$CODEX_HOME" != "$HOME/.codex" ]]; then
+    command_parts+=("CODEX_HOME=$(shell_quote "$CODEX_HOME")")
+  fi
+  command_parts+=("PATH=$(shell_quote "$cron_path")")
+  if [[ "$codex_name" != "codex" || "$CODEX_AUTH_CODEX_BIN" != "codex" ]]; then
+    command_parts+=("CODEX_AUTH_CODEX_BIN=$(shell_quote "$codex_name")")
+  fi
+  command_parts+=("$(shell_quote "$script_path")")
+  command_parts+=("cron")
+  command_parts+=("run")
+  command_parts+=("$(shell_quote "$job_id")")
+  command_parts+=("$(shell_quote "$target")")
+
+  printf '%s >> %s 2>&1\n' "${command_parts[*]}" "$(shell_quote "$CRON_LOG_FILE")"
+}
+
+cron_print_preview() {
+  local job_id=$1
+  local cron_expr=$2
+  local schedule_description=$3
+  local target=$4
+  local runner_command=$5
+  local touch_label
+  touch_label=$(cron_touch_command_label "$target")
+  note "$(style_text CODEX_AUTH_THEME_HEADER_STYLE "Cron job preview")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "ID:") $(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$job_id")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Schedule:") $(style_text CODEX_AUTH_THEME_RESET_STYLE "$schedule_description")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Cron:") $(style_text CODEX_AUTH_THEME_ACTIVE_STYLE "$cron_expr")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Touch command:") $(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$touch_label")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Cron command:") $runner_command"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Log:") $(style_text CODEX_AUTH_THEME_RESET_STYLE "$CRON_LOG_FILE")"
+}
+
+cron_confirm_install() {
+  local reply read_status=0
+  if wizard_whiptail_enabled; then
+    whiptail \
+      --title "codex-auth cron setup" \
+      --backtitle "codex-auth" \
+      --yesno "Install this cron job?" 8 60 || {
+        note "Cron setup cancelled."
+        return 1
+      }
+    return 0
+  fi
+
+  printf '%s [Y/n] ' "$(style_text CODEX_AUTH_THEME_RESET_STYLE "Install this cron job?")" >&2
+  read -r reply || read_status=$?
+  if [[ $read_status -ne 0 ]]; then
+    note "Cron setup cancelled."
+    return 1
+  fi
+  case "$reply" in
+    ""|y|Y|yes|YES|Yes)
+      return 0
+      ;;
+    *)
+      note "Cron setup cancelled."
+      return 1
+      ;;
+  esac
+}
+
+wizard_read_line() {
+  local prompt=$1
+  local default_value=${2:-}
+  local reply read_status=0
+
+  if wizard_whiptail_enabled; then
+    reply=$(whiptail \
+      --title "codex-auth cron setup" \
+      --backtitle "codex-auth" \
+      --inputbox "$prompt" 9 76 "$default_value" \
+      3>&1 1>&2 2>&3) || read_status=$?
+    if [[ $read_status -ne 0 ]]; then
+      die "Cron setup cancelled."
+    fi
+    printf '%s\n' "$reply"
+    return 0
+  fi
+
+  printf '%s' "$(style_text CODEX_AUTH_THEME_RESET_STYLE "$prompt")" >&2
+  if [[ -n "$default_value" ]]; then
+    printf ' [%s]' "$default_value" >&2
+  fi
+  printf ': ' >&2
+
+  if [[ -t 0 ]]; then
+    read -e -r reply || read_status=$?
+  else
+    read -r reply || read_status=$?
+  fi
+
+  [[ $read_status -eq 0 ]] || die "Cron setup cancelled."
+  [[ -n "$reply" ]] || reply="$default_value"
+  printf '%s\n' "$reply"
+}
+
+cron_install_job_locked() {
+  local target=$1
+  local schedule_type=$2
+  local time_value=$3
+  local custom_expression=$4
+  local explicit_id=$5
+  local assume_yes=$6
+
+  cron_validate_target "$target"
+  mkdir -p "$CRON_DIR"
+
+  local crontab_file new_crontab_file cron_expr schedule_description base_id job_id runner_command
+  crontab_file=$(mktemp)
+  new_crontab_file=$(mktemp)
+  cron_read_current > "$crontab_file"
+
+  if [[ "$schedule_type" == "custom" ]]; then
+    validate_cron_expression "$custom_expression" || die "Invalid custom cron expression '$custom_expression' (expected five fields)"
+    cron_expr="$custom_expression"
+  else
+    cron_expr=$(cron_expr_from_time "$schedule_type" "$time_value")
+  fi
+  schedule_description=$(cron_schedule_description "$schedule_type" "$time_value" "$cron_expr")
+
+  if [[ -n "$explicit_id" ]]; then
+    validate_cron_job_id "$explicit_id"
+    job_id="$explicit_id"
+    if cron_has_job_id "$crontab_file" "$job_id"; then
+      rm -f "$crontab_file" "$new_crontab_file"
+      die "A codex-auth touch cron job with id '$job_id' already exists"
+    fi
+  else
+    base_id=$(cron_default_job_id_base "$schedule_type" "$time_value" "$target")
+    job_id=$(cron_unique_job_id "$crontab_file" "$base_id")
+  fi
+
+  runner_command=$(cron_runner_command "$job_id" "$target")
+  cron_print_preview "$job_id" "$cron_expr" "$schedule_description" "$target" "$runner_command"
+  if [[ "$assume_yes" != "1" ]]; then
+    cron_confirm_install || {
+      rm -f "$crontab_file" "$new_crontab_file"
+      return 1
+    }
+  fi
+
+  cp "$crontab_file" "$new_crontab_file"
+  if [[ -s "$new_crontab_file" ]] && [[ "$(tail -c 1 "$new_crontab_file" 2>/dev/null || true)" != "" ]]; then
+    printf '\n' >> "$new_crontab_file"
+  fi
+  {
+    printf '# BEGIN codex-auth touch %s\n' "$job_id"
+    printf '# schedule: %s\n' "$schedule_description"
+    printf '# target: %s\n' "$target"
+    printf '# log: %s\n' "$CRON_LOG_FILE"
+    printf '%s %s\n' "$cron_expr" "$runner_command"
+    printf '# END codex-auth touch %s\n' "$job_id"
+  } >> "$new_crontab_file"
+
+  cron_install_file "$new_crontab_file"
+  rm -f "$crontab_file" "$new_crontab_file"
+  note "Installed codex-auth touch cron job '$job_id'"
+}
+
+cron_add_command() {
+  local target="--all"
+  local schedule_type="daily"
+  local time_value=""
+  local custom_expression=""
+  local explicit_id=""
+  local assume_yes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --time)
+        shift
+        [[ $# -gt 0 ]] || die "Usage: codex-auth cron add --time HH:MM [--daily] [--all|--profile NAME] [--yes]"
+        time_value="$1"
+        ;;
+      --daily)
+        schedule_type="daily"
+        ;;
+      --schedule)
+        shift
+        [[ $# -gt 0 ]] || die "Usage: codex-auth cron add --schedule \"M H DOM MON DOW\" [--all|--profile NAME] [--yes]"
+        schedule_type="custom"
+        custom_expression="$1"
+        ;;
+      --all)
+        target="--all"
+        ;;
+      --profile)
+        shift
+        [[ $# -gt 0 ]] || die "Usage: codex-auth cron add --profile <name>"
+        target="$1"
+        ;;
+      --id)
+        shift
+        [[ $# -gt 0 ]] || die "Usage: codex-auth cron add --id <job-id>"
+        explicit_id="$1"
+        ;;
+      --yes|-y)
+        assume_yes=1
+        ;;
+      --help|-h)
+        cron_usage
+        return 0
+        ;;
+      *)
+        die "Usage: codex-auth cron add [--time HH:MM|--schedule \"M H DOM MON DOW\"] [--daily] [--all|--profile NAME] [--id JOB] [--yes]"
+        ;;
+    esac
+    shift
+  done
+
+  if [[ "$schedule_type" == "custom" ]]; then
+    [[ -n "$custom_expression" ]] || die "Usage: codex-auth cron add --schedule \"M H DOM MON DOW\""
+  else
+    [[ -n "$time_value" ]] || die "Usage: codex-auth cron add --time HH:MM [--daily]"
+    validate_cron_time "$time_value"
+  fi
+
+  cron_with_lock cron_install_job_locked "$target" "$schedule_type" "$time_value" "$custom_expression" "$explicit_id" "$assume_yes"
+}
+
+wizard_whiptail_enabled() {
+  [[ "${CODEX_AUTH_DISABLE_WHIPTAIL:-0}" == "1" ]] && return 1
+  have_cmd whiptail || return 1
+  [[ "${CODEX_AUTH_FORCE_WHIPTAIL:-0}" == "1" ]] && return 0
+  [[ "${TERM:-}" == "dumb" ]] && return 1
+  [[ -t 0 && -t 2 ]]
+}
+
+wizard_option_field() {
+  local option=$1
+  local field=$2
+  local label value description
+  IFS=$'\t' read -r label value description <<< "$option"
+  case "$field" in
+    label) printf '%s\n' "$label" ;;
+    value) printf '%s\n' "$value" ;;
+    description) printf '%s\n' "$description" ;;
+  esac
+}
+
+wizard_whiptail_select() {
+  local title=$1
+  local default_index=$2
+  shift 2
+  local -a options=("$@")
+  local -a args=()
+  local index label value description default_value result status=0
+
+  default_value=$(wizard_option_field "${options[default_index]}" value)
+  for index in "${!options[@]}"; do
+    label=$(wizard_option_field "${options[index]}" label)
+    value=$(wizard_option_field "${options[index]}" value)
+    description=$(wizard_option_field "${options[index]}" description)
+    args+=("$value" "$label${description:+ — $description}")
+  done
+
+  result=$(whiptail \
+    --title "codex-auth cron setup" \
+    --backtitle "codex-auth" \
+    --default-item "$default_value" \
+    --menu "$title" 15 78 "${#options[@]}" \
+    "${args[@]}" \
+    3>&1 1>&2 2>&3) || status=$?
+  [[ $status -eq 0 ]] || die "Cron setup cancelled."
+  printf '%s\n' "$result"
+}
+
+wizard_select_numbered() {
+  local title=$1
+  local default_index=$2
+  shift 2
+  local -a options=("$@")
+  local reply read_status=0 index label description value
+
+  note "$(style_text CODEX_AUTH_THEME_HEADER_STYLE "$title")"
+  for index in "${!options[@]}"; do
+    label=$(wizard_option_field "${options[index]}" label)
+    description=$(wizard_option_field "${options[index]}" description)
+    printf '  %d) %s' "$((index + 1))" "$(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$label")" >&2
+    if [[ -n "$description" ]]; then
+      printf ' %s' "$(style_text CODEX_AUTH_THEME_DIM_STYLE "$description")" >&2
+    fi
+    printf '\n' >&2
+  done
+  printf '%s [%d]: ' "$(style_text CODEX_AUTH_THEME_RESET_STYLE "Choose")" "$((default_index + 1))" >&2
+  read -r reply || read_status=$?
+  [[ $read_status -eq 0 ]] || die "Cron setup cancelled."
+  if [[ -z "$reply" ]]; then
+    reply=$((default_index + 1))
+  fi
+  [[ "$reply" =~ ^[0-9]+$ ]] || die "Invalid selection"
+  (( reply >= 1 && reply <= ${#options[@]} )) || die "Selection out of range"
+  value=$(wizard_option_field "${options[reply-1]}" value)
+  printf '%s\n' "$value"
+}
+
+wizard_select() {
+  if wizard_whiptail_enabled; then
+    wizard_whiptail_select "$@"
+  else
+    wizard_select_numbered "$@"
+  fi
+}
+
+cron_prompt_target() {
+  local selection
+  selection=$(wizard_select \
+    "Touch target" \
+    0 \
+    $'All profiles\tall\tRecommended; touch every saved profile' \
+    $'One profile\tprofile\tChoose a saved profile')
+  case "$selection" in
+    all)
+      printf '%s\n' "--all"
+      ;;
+    profile)
+      choose_profile_interactive "$(find_matching_profile || true)"
+      ;;
+    *)
+      die "Invalid target selection"
+      ;;
+  esac
+}
+
+cron_prompt_schedule_type() {
+  wizard_select \
+    "Schedule" \
+    0 \
+    $'Daily at a time\tdaily\tRecommended' \
+    $'Custom cron expression\tcustom\tAdvanced'
+}
+
+cron_prompt_time() {
+  local default_time=${1:-08:30}
+  local reply
+  reply=$(wizard_read_line "Run time (HH:MM, 24-hour)" "$default_time")
+  validate_cron_time "$reply"
+  printf '%s\n' "$reply"
+}
+
+cron_prompt_custom_expression() {
+  local reply
+  if ! wizard_whiptail_enabled; then
+    note "$(style_text CODEX_AUTH_THEME_HEADER_STYLE "Custom cron expression")"
+    note "$(style_text CODEX_AUTH_THEME_DIM_STYLE "Enter five fields: minute hour day-of-month month day-of-week")"
+    note "$(style_text CODEX_AUTH_THEME_DIM_STYLE "Example: 30 8 * * 1,3,5  (Monday, Wednesday, Friday at 08:30)")"
+  fi
+  reply=$(wizard_read_line "Cron fields (minute hour day-of-month month day-of-week; e.g. 30 8 * * 1,3,5)" "")
+  validate_cron_expression "$reply" || die "Invalid custom cron expression '$reply' (expected five fields)"
+  printf '%s\n' "$reply"
+}
+
+cron_setup_command() {
+  ensure_dirs
+  note "$(style_text CODEX_AUTH_THEME_HEADER_STYLE "Existing codex-auth touch cron jobs")"
+  cron_list_command
+  note ""
+
+  local target schedule_type time_value="" custom_expression=""
+  target=$(cron_prompt_target)
+  schedule_type=$(cron_prompt_schedule_type)
+  if [[ "$schedule_type" == "custom" ]]; then
+    custom_expression=$(cron_prompt_custom_expression)
+  else
+    time_value=$(cron_prompt_time "08:30")
+  fi
+
+  cron_with_lock cron_install_job_locked "$target" "$schedule_type" "$time_value" "$custom_expression" "" "0"
+}
+
+choose_cron_job_interactive() {
+  local crontab_file=$1
+  local entries_file use_fzf=0
+  entries_file=$(mktemp)
+  cron_job_tsv_from_file "$crontab_file" > "$entries_file"
+  [[ $(wc -l < "$entries_file") -gt 1 ]] || die "No codex-auth touch cron jobs to delete"
+
+  if command -v fzf >/dev/null 2>&1; then
+    if [[ "${CODEX_AUTH_FORCE_FZF:-0}" == "1" ]] || [[ -t 0 ]] || [[ -r /dev/tty ]]; then
+      use_fzf=1
+    fi
+  fi
+
+  if [[ $use_fzf -eq 1 ]]; then
+    local selected
+    local -a fzf_opts
+    fzf_opts=(--delimiter=$'\t' --with-nth=2 --header-lines=1 --prompt='Delete cron job> ' --layout=reverse --border)
+    if [[ -n "${TMUX:-}" ]] && ( [[ -t 0 ]] || [[ -r /dev/tty ]] ) && command -v fzf-tmux >/dev/null 2>&1; then
+      selected=$(fzf-tmux -p 80%,70% "${fzf_opts[@]}" < "$entries_file" || true)
+    else
+      fzf_opts+=(--height=80%)
+      selected=$(fzf "${fzf_opts[@]}" < "$entries_file" || true)
+    fi
+    [[ -n "$selected" ]] || die "No cron job selected"
+    rm -f "$entries_file"
+    printf '%s\n' "$selected" | cut -f1
+    return 0
+  fi
+
+  local options=() i=1 choice display job_id
+  echo "Select a cron job to delete:" >&2
+  while IFS=$'\t' read -r job_id display; do
+    [[ "$job_id" == "ID" ]] && continue
+    options+=("$job_id")
+    printf '  %d) %s\n' "$i" "$display" >&2
+    i=$((i + 1))
+  done < "$entries_file"
+  read -r -p 'Enter number: ' choice
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid selection"
+  (( choice >= 1 && choice <= ${#options[@]} )) || die "Selection out of range"
+  rm -f "$entries_file"
+  printf '%s\n' "${options[choice-1]}"
+}
+
+cron_confirm_delete() {
+  local description=$1
+  local reply read_status=0
+  printf 'Delete %s? [y/N] ' "$description" >&2
+  read -r reply || read_status=$?
+  [[ $read_status -eq 0 ]] || return 1
+  case "$reply" in
+    y|Y|yes|YES|Yes)
+      return 0
+      ;;
+    *)
+      note "Cron delete cancelled."
+      return 1
+      ;;
+  esac
+}
+
+cron_delete_jobs_locked() {
+  local delete_all=$1
+  shift
+  local -a ids=("$@")
+  local crontab_file new_crontab_file deleted_file
+  crontab_file=$(mktemp)
+  new_crontab_file=$(mktemp)
+  deleted_file=$(mktemp)
+  cron_read_current > "$crontab_file"
+
+  python3 - "$crontab_file" "$new_crontab_file" "$deleted_file" "$delete_all" "${ids[@]}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+in_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+deleted_path = Path(sys.argv[3])
+delete_all = sys.argv[4] == '1'
+ids = set(sys.argv[5:])
+
+lines = in_path.read_text(encoding='utf-8').splitlines() if in_path.exists() else []
+out = []
+deleted = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+    match = re.match(r'^# BEGIN codex-auth touch ([A-Za-z0-9._-]+)\s*$', line)
+    if not match:
+        out.append(line)
+        i += 1
+        continue
+
+    job_id = match.group(1)
+    block = [line]
+    i += 1
+    complete = False
+    while i < len(lines):
+        block.append(lines[i])
+        if re.match(rf'^# END codex-auth touch {re.escape(job_id)}\s*$', lines[i]):
+            complete = True
+            i += 1
+            break
+        i += 1
+
+    if complete and (delete_all or job_id in ids):
+        deleted.append(job_id)
+    else:
+        out.extend(block)
+
+out_path.write_text('\n'.join(out) + ('\n' if out else ''), encoding='utf-8')
+deleted_path.write_text('\n'.join(deleted) + ('\n' if deleted else ''), encoding='utf-8')
+PY
+
+  if [[ ! -s "$deleted_file" ]]; then
+    rm -f "$crontab_file" "$new_crontab_file" "$deleted_file"
+    if [[ "$delete_all" == "1" ]]; then
+      die "No codex-auth touch cron jobs to delete"
+    fi
+    die "No matching codex-auth touch cron job found"
+  fi
+
+  cron_install_file "$new_crontab_file"
+  local deleted_id
+  while IFS= read -r deleted_id; do
+    [[ -n "$deleted_id" ]] || continue
+    note "Deleted codex-auth touch cron job '$deleted_id'"
+  done < "$deleted_file"
+  rm -f "$crontab_file" "$new_crontab_file" "$deleted_file"
+}
+
+cron_delete_command() {
+  local target=""
+  local assume_yes=0
+  local delete_all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        [[ -z "$target" ]] || die "Usage: codex-auth cron delete [<job-id>|--all] [--yes]"
+        delete_all=1
+        target="--all"
+        ;;
+      --yes|-y)
+        assume_yes=1
+        ;;
+      --help|-h)
+        cron_usage
+        return 0
+        ;;
+      -*)
+        die "Usage: codex-auth cron delete [<job-id>|--all] [--yes]"
+        ;;
+      *)
+        [[ -z "$target" ]] || die "Usage: codex-auth cron delete [<job-id>|--all] [--yes]"
+        target="$1"
+        ;;
+    esac
+    shift
+  done
+
+  local crontab_file
+  crontab_file=$(mktemp)
+  cron_read_current > "$crontab_file"
+  if [[ -z "$target" ]]; then
+    target=$(choose_cron_job_interactive "$crontab_file")
+  fi
+
+  if [[ "$delete_all" -eq 1 ]]; then
+    if [[ "$assume_yes" -ne 1 ]]; then
+      cron_confirm_delete "all codex-auth touch cron jobs" || {
+        rm -f "$crontab_file"
+        return 1
+      }
+    fi
+    rm -f "$crontab_file"
+    cron_with_lock cron_delete_jobs_locked 1
+    return $?
+  fi
+
+  validate_cron_job_id "$target"
+  if [[ "$assume_yes" -ne 1 ]]; then
+    cron_confirm_delete "codex-auth touch cron job '$target'" || {
+      rm -f "$crontab_file"
+      return 1
+    }
+  fi
+  rm -f "$crontab_file"
+  cron_with_lock cron_delete_jobs_locked 0 "$target"
+}
+
+cron_run_command() {
+  local job_id=${1:-}
+  local target=${2:-}
+  [[ -n "$job_id" && -n "$target" ]] || die "Usage: codex-auth cron run <job-id> <profile|--all>"
+  validate_cron_job_id "$job_id"
+  cron_validate_target "$target"
+  mkdir -p "$CRON_DIR"
+
+  local touch_label status=0 started_at ended_at
+  touch_label=$(cron_touch_command_label "$target")
+  started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  printf '[%s] START %s (job=%s)\n' "$started_at" "$touch_label" "$job_id"
+  if touch_command "$target"; then
+    status=0
+  else
+    status=$?
+  fi
+  ended_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  printf '[%s] END %s (job=%s status=%s)\n' "$ended_at" "$touch_label" "$job_id" "$status"
+  return "$status"
+}
+
+cron_command() {
+  local subcmd=${1:-list}
+  case "$subcmd" in
+    list)
+      shift || true
+      [[ $# -eq 0 ]] || die "Usage: codex-auth cron list"
+      cron_list_command
+      ;;
+    setup|wizard)
+      shift || true
+      [[ $# -eq 0 ]] || die "Usage: codex-auth cron setup"
+      cron_setup_command
+      ;;
+    add)
+      shift || true
+      cron_add_command "$@"
+      ;;
+    delete|remove|rm)
+      shift || true
+      cron_delete_command "$@"
+      ;;
+    run)
+      shift || true
+      [[ $# -eq 2 ]] || die "Usage: codex-auth cron run <job-id> <profile|--all>"
+      cron_run_command "$1" "$2"
+      ;;
+    help|-h|--help)
+      cron_usage
+      ;;
+    *)
+      die "Unknown cron command '$subcmd' (run 'codex-auth cron help')"
+      ;;
+  esac
 }
 
 update_self() {
@@ -2565,6 +3616,10 @@ main() {
       shift
       [[ $# -eq 1 ]] || die "Usage: codex-auth touch <name>|--all"
       touch_command "$1"
+      ;;
+    cron)
+      shift
+      cron_command "$@"
       ;;
     update)
       shift
