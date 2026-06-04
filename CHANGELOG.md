@@ -2,6 +2,13 @@
 
 Newest releases go at the top.
 
+## 0.8.0 - 2026-06-04
+
+- Added `token-status` to inspect saved profile ID-token and access-token expirations without changing the main profile list; it defaults to all profiles and uses the same active marker/color style as `list`.
+- Added `touch <profile>|--all` to switch through profiles, run a minimal Codex request, persist the live auth snapshot, report whether tokens actually rotated, and restore the original profile.
+- Started tracking both ID-token and access-token expiration metadata in saved profile `meta.json` files.
+- Clarified that `refresh` / `refresh-usage` refresh live usage data, not OAuth tokens.
+
 ## 0.7.0 - 2026-04-21
 
 - Persist the latest per-profile refresh failure in `usage.json` so `list` and `current` keep showing unresolved refresh problems until the next successful refresh clears them.

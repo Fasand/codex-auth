@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.7.0"
+EXPECTED_VERSION="0.8.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -58,6 +58,58 @@ create_profile_fixture() {
 JSON
   cat > "$home_dir/accounts/profiles/$profile_name/meta.json" <<JSON
 {"profileName":"$profile_name","email":"$email","accountId":"$account_id"}
+JSON
+}
+
+make_jwt() {
+  local email=$1
+  local subject=$2
+  local exp=$3
+  local iat=${4:-1770000000}
+  local aud=${5:-https://api.openai.com/v1}
+  local auth_provider=${6:-password}
+  python3 - "$email" "$subject" "$exp" "$iat" "$aud" "$auth_provider" <<'PY'
+import base64
+import json
+import sys
+
+email, subject, exp, iat, aud, auth_provider = sys.argv[1:7]
+
+def b64(obj):
+    raw = json.dumps(obj, separators=(',', ':')).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+header = {'alg': 'none', 'typ': 'JWT'}
+payload = {
+    'email': email,
+    'email_verified': True,
+    'sub': subject,
+    'aud': [aud],
+    'iss': 'https://auth.openai.com',
+    'iat': int(iat),
+    'exp': int(exp),
+    'auth_provider': auth_provider,
+}
+print(f"{b64(header)}.{b64(payload)}.")
+PY
+}
+
+create_profile_fixture_with_jwts() {
+  local home_dir=$1
+  local profile_name=$2
+  local email=$3
+  local account_id=$4
+  local id_exp=$5
+  local access_exp=$6
+  local id_token access_token
+  id_token=$(make_jwt "$email" "sub_$profile_name" "$id_exp" 1770000000 "app_EMoamEEZ73f0CkXaXp7hrann")
+  access_token=$(make_jwt "$email" "sub_$profile_name" "$access_exp" 1770000000 "https://api.openai.com/v1")
+  mkdir -p "$home_dir/accounts/profiles/$profile_name"
+  cat > "$home_dir/accounts/profiles/$profile_name/auth.json" <<JSON
+{"auth_mode":"chatgpt","last_refresh":"2026-06-04T10:28:41Z","tokens":{"access_token":"$access_token","id_token":"$id_token","refresh_token":"refresh_$profile_name","account_id":"$account_id"}}
+JSON
+  cat > "$home_dir/accounts/profiles/$profile_name/meta.json" <<JSON
+{"profileName":"$profile_name","email":"$email","accountId":"$account_id","tokenExpiresAt":"2026-06-04T11:28:41Z"}
 JSON
 }
 
@@ -246,6 +298,8 @@ test_help_mentions_refresh_alias_and_utc_flag() {
   output=$(bash "$ROOT_DIR/bin/codex-auth" help)
   assert_contains "$output" "refresh-usage [--utc] [--with-stats] [<name>|--all]"
   assert_contains "$output" "refresh [--utc] [--with-stats] [<name>|--all]"
+  assert_contains "$output" "token-status [--utc] [<name>|--all]"
+  assert_contains "$output" "touch <name>|--all"
   assert_contains "$output" "list [--utc] [--with-stats]"
   assert_contains "$output" "current [--utc]"
 }
@@ -322,7 +376,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-04-21"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-06-04"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
@@ -341,12 +395,172 @@ test_completion_lists_update_command() {
   completion=$(cat "$ROOT_DIR/completions/codex-auth.bash")
   assert_contains "$completion" "update"
   assert_contains "$completion" "refresh"
+  assert_contains "$completion" "token-status"
+  assert_contains "$completion" "touch"
   assert_contains "$completion" "stats"
   assert_contains "$completion" "statistics"
   assert_contains "$completion" "--utc"
   assert_contains "$completion" "--period"
   assert_contains "$completion" "--with-stats"
   assert_contains "$completion" "--recompute"
+}
+
+test_save_tracks_id_and_access_token_expiry_in_meta() {
+  local home_dir port_file server_pid usage_url id_token access_token
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "$server_pid" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+  mkdir -p "$home_dir"
+  id_token=$(make_jwt "alpha@example.com" "sub_alpha" 1780572521 1780568921 "app_EMoamEEZ73f0CkXaXp7hrann")
+  access_token=$(make_jwt "alpha@example.com" "sub_alpha" 1781432921 1780568921 "https://api.openai.com/v1")
+  cat > "$home_dir/auth.json" <<JSON
+{"auth_mode":"chatgpt","last_refresh":"2026-06-04T10:28:41Z","tokens":{"access_token":"$access_token","id_token":"$id_token","refresh_token":"refresh_alpha","account_id":"acct_alpha"}}
+JSON
+
+  CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" save alpha >/dev/null
+
+  python3 - "$home_dir/accounts/profiles/alpha/meta.json" <<'PY' || fail "expected meta.json to track both token expirations"
+import json
+import sys
+meta = json.load(open(sys.argv[1]))
+assert meta["idTokenExpiresAt"] == "2026-06-04T11:28:41Z"
+assert meta["accessTokenExpiresAt"] == "2026-06-14T10:28:41Z"
+assert meta["tokenExpiresAt"] == "2026-06-04T11:28:41Z"
+assert meta["hasRefreshToken"] is True
+PY
+  kill "$server_pid" 2>/dev/null || true
+  trap - RETURN
+}
+
+test_token_status_reports_both_token_expirations() {
+  local home_dir output
+  home_dir=$(mktemp -d)
+  create_profile_fixture_with_jwts "$home_dir" "alpha" "alpha@example.com" "acct_alpha" 1780572521 1781432921
+  create_profile_fixture_with_jwts "$home_dir" "beta" "beta@example.com" "acct_beta" 1770000100 1770000200
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" token-status --utc)
+
+  assert_contains "$output" "PROFILE"
+  assert_contains "$output" "ID TOKEN"
+  assert_contains "$output" "ACCESS TOKEN"
+  assert_contains "$output" "alpha"
+  assert_contains "$output" "beta"
+  assert_contains "$output" "alpha@example.com"
+  assert_contains "$output" "2026-06-04 11:28Z"
+  assert_contains "$output" "2026-06-14 10:28Z"
+  assert_contains "$output" "2026-06-04 10:28Z"
+  assert_contains "$output" "refresh=yes"
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" token-status --utc alpha)
+  assert_contains "$output" "alpha"
+  assert_not_contains "$output" "beta"
+}
+
+test_token_status_uses_color_and_active_marker_when_enabled() {
+  local home_dir output
+  home_dir=$(mktemp -d)
+  create_profile_fixture_with_jwts "$home_dir" "alpha" "alpha@example.com" "acct_alpha" 1780572521 1781432921
+  create_profile_fixture_with_jwts "$home_dir" "beta" "beta@example.com" "acct_beta" 1770000100 1770000200
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+
+  output=$(CODEX_AUTH_FORCE_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" token-status --utc)
+
+  assert_contains "$output" $'\033[1;97mPROFILE\033[0m'
+  assert_contains "$output" $'\033[1;93m*\033[0m'
+  assert_contains "$output" $'\033[32mvalid'
+  assert_contains "$output" $'\033[31mexpired'
+}
+
+test_touch_profile_runs_minimal_codex_exec_saves_token_and_restores_current_profile() {
+  local home_dir stub_dir output log_file
+  home_dir=$(mktemp -d)
+  stub_dir=$(mktemp -d)
+  log_file="$stub_dir/codex.log"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+  cat > "$stub_dir/codex" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CODEX_STUB_LOG"
+if [[ "${1:-}" == "exec" ]]; then
+  printf 'codex noisy stderr\n' >&2
+  python3 - "$CODEX_HOME/auth.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+obj = json.loads(path.read_text())
+account_id = obj.get("tokens", {}).get("account_id", "unknown")
+obj.setdefault("tokens", {})["access_token"] = f"refreshed_{account_id}"
+obj["last_refresh"] = "2026-06-04T12:00:00Z"
+path.write_text(json.dumps(obj), encoding="utf-8")
+PY
+  printf 'hi\n'
+fi
+SCRIPT
+  chmod +x "$stub_dir/codex"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" CODEX_STUB_LOG="$log_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" touch beta 2>&1)
+
+  assert_contains "$output" "Touching beta"
+  assert_contains "$output" "Restored profile 'alpha'"
+  assert_contains "$output" "Tokens refreshed for 'beta'"
+  assert_not_contains "$output" "Switched to"
+  assert_not_contains "$output" "codex noisy stderr"
+  assert_contains "$(cat "$log_file")" "exec"
+  assert_contains "$(cat "$log_file")" "--ephemeral"
+  assert_contains "$(cat "$log_file")" "--ignore-user-config"
+  assert_contains "$(cat "$log_file")" "--ignore-rules"
+  assert_contains "$(cat "$log_file")" "--skip-git-repo-check"
+  assert_contains "$(cat "$log_file")" "--sandbox read-only"
+  assert_not_contains "$(cat "$log_file")" "model_reasoning_effort"
+  [[ "$(cat "$home_dir/accounts/current_profile")" == "alpha" ]] || fail "expected touch to restore current profile marker"
+  assert_contains "$(cat "$home_dir/auth.json")" "token_alpha"
+  assert_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "refreshed_acct_beta"
+}
+
+test_touch_reports_when_codex_does_not_rotate_tokens() {
+  local home_dir stub_dir output log_file
+  home_dir=$(mktemp -d)
+  stub_dir=$(mktemp -d)
+  log_file="$stub_dir/codex.log"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+  cat > "$stub_dir/codex" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CODEX_STUB_LOG"
+if [[ "${1:-}" == "exec" ]]; then
+  printf 'hi\n'
+fi
+SCRIPT
+  chmod +x "$stub_dir/codex"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" CODEX_STUB_LOG="$log_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" touch alpha 2>&1)
+
+  assert_contains "$output" "Touching alpha"
+  assert_contains "$output" "Tokens unchanged for 'alpha'"
+  assert_contains "$output" "Codex did not rotate tokens during this run"
+}
+
+test_touch_refuses_to_run_when_touch_lock_exists() {
+  local home_dir stub_dir output status=0
+  home_dir=$(mktemp -d)
+  stub_dir=$(make_stub_codex_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  mkdir -p "$home_dir/accounts/touch.lock"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" touch alpha 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected touch to fail when another touch lock exists"
+  assert_contains "$output" "Another codex-auth touch operation is already running"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -826,6 +1040,12 @@ main() {
   test_refresh_without_args_prompts_and_lists_all_profiles
   test_refresh_cancel_shows_usage_instruction
   test_refresh_continues_after_profile_failures_and_summarizes
+  test_save_tracks_id_and_access_token_expiry_in_meta
+  test_token_status_reports_both_token_expirations
+  test_token_status_uses_color_and_active_marker_when_enabled
+  test_touch_profile_runs_minimal_codex_exec_saves_token_and_restores_current_profile
+  test_touch_reports_when_codex_does_not_rotate_tokens
+  test_touch_refuses_to_run_when_touch_lock_exists
   test_list_skips_session_stats_by_default_and_with_stats_opts_in
   test_refresh_with_stats_flag_includes_session_footer
   test_stats_reports_overview_daily_and_model_breakdown

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.7.0"
+APP_VERSION="0.8.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -46,6 +46,10 @@ Commands:
                             Query live usage for one profile or, with no args, confirm refresh for all profiles
   refresh [--utc] [--with-stats] [<name>|--all]
                             Alias for refresh-usage
+  token-status [--utc] [<name>|--all]
+                            Show saved ID/access token expiry metadata
+                            Defaults to all profiles when no name is provided
+  touch <name>|--all        Run a minimal Codex request for profile(s), save live auth, and report whether tokens rotated
   stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
                             Show global session token statistics from rollout history
   statistics [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
@@ -175,15 +179,22 @@ profile_name, auth_path = sys.argv[1:3]
 obj = json.loads(Path(auth_path).read_text())
 tokens = obj.get('tokens') or {}
 id_token = tokens.get('id_token') or ''
-claims = {}
-if isinstance(id_token, str) and '.' in id_token:
-    parts = id_token.split('.')
+access_token = tokens.get('access_token') or ''
+
+def jwt_claims(token):
+    if not isinstance(token, str) or '.' not in token:
+        return {}
+    parts = token.split('.')
     if len(parts) >= 2 and parts[1]:
         payload = parts[1] + '=' * (-len(parts[1]) % 4)
         try:
-            claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+            return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
         except Exception:
-            claims = {}
+            return {}
+    return {}
+
+id_claims = jwt_claims(id_token)
+access_claims = jwt_claims(access_token)
 
 def iso_from_epoch(value):
     if value is None:
@@ -196,14 +207,20 @@ def iso_from_epoch(value):
 meta = {
     'profileName': profile_name,
     'savedAt': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-    'email': claims.get('email'),
-    'emailVerified': claims.get('email_verified'),
-    'subject': claims.get('sub'),
+    'email': id_claims.get('email') or access_claims.get('email'),
+    'emailVerified': id_claims.get('email_verified') if id_claims.get('email_verified') is not None else access_claims.get('email_verified'),
+    'subject': id_claims.get('sub') or access_claims.get('sub'),
     'accountId': tokens.get('account_id'),
     'lastRefresh': obj.get('last_refresh'),
-    'tokenExpiresAt': iso_from_epoch(claims.get('exp')),
-    'tokenExpiresEpoch': claims.get('exp'),
-    'authProvider': claims.get('auth_provider'),
+    # Backwards-compatible alias: historically this referred to the ID token.
+    'tokenExpiresAt': iso_from_epoch(id_claims.get('exp')),
+    'tokenExpiresEpoch': id_claims.get('exp'),
+    'idTokenExpiresAt': iso_from_epoch(id_claims.get('exp')),
+    'idTokenExpiresEpoch': id_claims.get('exp'),
+    'accessTokenExpiresAt': iso_from_epoch(access_claims.get('exp')),
+    'accessTokenExpiresEpoch': access_claims.get('exp'),
+    'hasRefreshToken': bool(tokens.get('refresh_token')),
+    'authProvider': id_claims.get('auth_provider') or access_claims.get('auth_provider'),
 }
 print(json.dumps(meta, indent=2, sort_keys=True))
 PY
@@ -1991,6 +2008,372 @@ refresh_usage_command() {
   return 0
 }
 
+token_status_payload_json() {
+  local profile_name=$1
+  local auth_path=$2
+  local use_utc=${3:-0}
+  local active_name=${4:-}
+  python3 - "$profile_name" "$auth_path" "$use_utc" "$active_name" <<'PY'
+import base64
+import datetime as dt
+import json
+import sys
+from pathlib import Path
+
+profile_name, auth_path, use_utc, active_name = sys.argv[1:5]
+use_utc = use_utc == '1'
+obj = json.loads(Path(auth_path).read_text())
+tokens = obj.get('tokens') or {}
+local_tz = dt.datetime.now().astimezone().tzinfo or dt.timezone.utc
+
+def claims(token):
+    if not isinstance(token, str) or '.' not in token:
+        return {}
+    parts = token.split('.')
+    if len(parts) < 2 or not parts[1]:
+        return {}
+    payload = parts[1] + '=' * (-len(parts[1]) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return {}
+
+def iso_from_epoch(value):
+    if value is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(int(value), tz=dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except Exception:
+        return None
+
+def format_epoch(value):
+    if value is None:
+        return 'unknown'
+    try:
+        parsed = dt.datetime.fromtimestamp(int(value), tz=dt.timezone.utc)
+    except Exception:
+        return str(value)
+    if use_utc:
+        return parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
+    localized = parsed.astimezone(local_tz)
+    return localized.strftime('%d %b %H:%M ') + (localized.tzname() or 'UTC')
+
+def format_datetime_text(value):
+    if not value:
+        return ''
+    text = str(value).strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if use_utc:
+        return parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
+    localized = parsed.astimezone(local_tz)
+    return localized.strftime('%d %b %H:%M ') + (localized.tzname() or 'UTC')
+
+def status(value):
+    if value is None:
+        return 'unknown'
+    try:
+        expires = dt.datetime.fromtimestamp(int(value), tz=dt.timezone.utc)
+    except Exception:
+        return 'unknown'
+    return 'expired' if expires <= dt.datetime.now(dt.timezone.utc) else 'valid'
+
+id_claims = claims(tokens.get('id_token'))
+access_claims = claims(tokens.get('access_token'))
+payload = {
+    'profile': profile_name,
+    'active': profile_name == active_name,
+    'email': id_claims.get('email') or access_claims.get('email') or 'unknown-email',
+    'account': tokens.get('account_id') or 'unknown-account',
+    'auth_provider': id_claims.get('auth_provider') or access_claims.get('auth_provider') or '',
+    'id_token': format_epoch(id_claims.get('exp')),
+    'id_status': status(id_claims.get('exp')),
+    'access_token': format_epoch(access_claims.get('exp')),
+    'access_status': status(access_claims.get('exp')),
+    'last_refresh': format_datetime_text(obj.get('last_refresh')),
+    'refresh': 'yes' if tokens.get('refresh_token') else 'no',
+    'id_token_expires_at': iso_from_epoch(id_claims.get('exp')),
+    'access_token_expires_at': iso_from_epoch(access_claims.get('exp')),
+}
+print(json.dumps(payload, sort_keys=True))
+PY
+}
+
+render_token_status_table() {
+  local payload_file=$1
+  python3 - "$payload_file" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
+headers = ['PROFILE', 'EMAIL', 'ACCOUNT', 'ID TOKEN', 'ACCESS TOKEN', 'REFRESH', 'LAST REFRESH']
+
+def color_enabled():
+    return os.environ.get('CODEX_AUTH_FORCE_COLOR') == '1' or (
+        os.environ.get('NO_COLOR') is None
+        and sys.stdout.isatty()
+        and os.environ.get('TERM', '') not in ('', 'dumb')
+    )
+
+USE_COLOR = color_enabled()
+
+def paint(value, env_name):
+    if not USE_COLOR:
+        return str(value)
+    style = os.environ.get(env_name, '')
+    return f"\033[{style}m{value}\033[0m" if style else str(value)
+
+def status_style(status):
+    if status == 'valid':
+        return 'CODEX_AUTH_THEME_PERCENT_OK_STYLE'
+    if status == 'expired':
+        return 'CODEX_AUTH_THEME_PERCENT_BAD_STYLE'
+    return 'CODEX_AUTH_THEME_DIM_STYLE'
+
+plain_values = []
+colored_values = []
+for row in rows:
+    active = bool(row.get('active'))
+    profile_plain = ('* ' if active else '  ') + (row.get('profile') or '')
+    id_plain = f"{row.get('id_status')} {row.get('id_token')}"
+    access_plain = f"{row.get('access_status')} {row.get('access_token')}"
+    refresh_plain = f"refresh={row.get('refresh') or 'no'}"
+    plain = [
+        profile_plain,
+        row.get('email') or '',
+        row.get('account') or '',
+        id_plain,
+        access_plain,
+        refresh_plain,
+        row.get('last_refresh') or '',
+    ]
+    marker = paint('*', 'CODEX_AUTH_THEME_ACTIVE_STYLE') if active else ' '
+    profile = paint(row.get('profile') or '', 'CODEX_AUTH_THEME_PROFILE_STYLE')
+    refresh_style = 'CODEX_AUTH_THEME_PERCENT_OK_STYLE' if row.get('refresh') == 'yes' else 'CODEX_AUTH_THEME_PERCENT_BAD_STYLE'
+    colored = [
+        f"{marker} {profile}",
+        row.get('email') or '',
+        paint(row.get('account') or '', 'CODEX_AUTH_THEME_DIM_STYLE'),
+        paint(id_plain, status_style(row.get('id_status'))),
+        paint(access_plain, status_style(row.get('access_status'))),
+        paint(refresh_plain, refresh_style),
+        paint(row.get('last_refresh') or '', 'CODEX_AUTH_THEME_DIM_STYLE'),
+    ]
+    plain_values.append(plain)
+    colored_values.append(colored)
+widths = [len(item) for item in headers]
+for row in plain_values:
+    for index, item in enumerate(row):
+        widths[index] = max(widths[index], len(str(item)))
+
+def pad(value, width):
+    return str(value) + (' ' * max(0, width - len(str(value))))
+
+print('  '.join(paint(pad(header, widths[index]), 'CODEX_AUTH_THEME_HEADER_STYLE') for index, header in enumerate(headers)).rstrip())
+for plain, colored in zip(plain_values, colored_values):
+    cells = []
+    for index, value in enumerate(colored):
+        suffix = ' ' * max(0, widths[index] - len(str(plain[index])))
+        cells.append(str(value) + suffix)
+    print('  '.join(cells).rstrip())
+PY
+}
+
+token_status_command() {
+  ensure_dirs
+  local target=${1:-}
+  local use_utc=${2:-0}
+  local payload_file name active_name
+  payload_file=$(mktemp)
+  active_name=$(find_matching_profile || true)
+  [[ -n "$target" ]] || target="--all"
+  if [[ "$target" == "--all" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      token_status_payload_json "$name" "$(profile_auth_path "$name")" "$use_utc" "$active_name" >> "$payload_file"
+    done < <(list_profile_names)
+  else
+    validate_profile_name "$target"
+    [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+    token_status_payload_json "$target" "$(profile_auth_path "$target")" "$use_utc" "$active_name" >> "$payload_file"
+  fi
+  if [[ -s "$payload_file" ]]; then
+    render_token_status_table "$payload_file"
+  else
+    note "No saved profiles in $PROFILES_DIR"
+  fi
+  rm -f "$payload_file"
+}
+
+sync_live_auth_to_profile_snapshot() {
+  local profile_name=$1
+  validate_profile_name "$profile_name"
+  require_auth_file
+  local auth_path meta_path
+  auth_path=$(profile_auth_path "$profile_name")
+  meta_path=$(profile_meta_path "$profile_name")
+  [[ -d "$(profile_dir "$profile_name")" ]] || die "Unknown profile '$profile_name'"
+  cp "$AUTH_FILE" "$auth_path"
+  write_meta_file "$profile_name" "$auth_path" "$meta_path"
+}
+
+report_touch_token_change() {
+  local profile_name=$1
+  local before_path=$2
+  local after_path=$3
+  python3 - "$profile_name" "$before_path" "$after_path" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+profile_name, before_path, after_path = sys.argv[1:4]
+
+def load(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return {}
+
+def digest(value):
+    if not value:
+        return ''
+    return hashlib.sha256(str(value).encode()).hexdigest()
+
+before = load(before_path)
+after = load(after_path)
+before_tokens = before.get('tokens') or {}
+after_tokens = after.get('tokens') or {}
+
+id_changed = digest(before_tokens.get('id_token')) != digest(after_tokens.get('id_token'))
+access_changed = digest(before_tokens.get('access_token')) != digest(after_tokens.get('access_token'))
+last_refresh_changed = before.get('last_refresh') != after.get('last_refresh')
+
+if id_changed or access_changed:
+    changed = []
+    if id_changed:
+        changed.append('ID token')
+    if access_changed:
+        changed.append('access token')
+    print(f"Tokens refreshed for '{profile_name}' ({', '.join(changed)} changed)")
+elif last_refresh_changed:
+    print(f"Auth metadata updated for '{profile_name}', but ID/access tokens are unchanged")
+else:
+    print(f"Tokens unchanged for '{profile_name}' (Codex did not rotate tokens during this run)")
+PY
+}
+
+touch_one_profile() {
+  local profile_name=$1
+  validate_profile_name "$profile_name"
+  [[ -d "$(profile_dir "$profile_name")" ]] || die "Unknown profile '$profile_name'"
+  local tmp_dir codex_output before_auth status=0
+  note "Touching $profile_name"
+  before_auth=$(mktemp)
+  cp "$(profile_auth_path "$profile_name")" "$before_auth"
+  switch_profile "$profile_name" >/dev/null 2>&1
+  tmp_dir=$(mktemp -d)
+  codex_output=$(mktemp)
+  if codex exec \
+    --ephemeral \
+    --ignore-user-config \
+    --ignore-rules \
+    --skip-git-repo-check \
+    --sandbox read-only \
+    -C "$tmp_dir" \
+    'Reply with exactly: hi' >"$codex_output" 2>&1; then
+    sync_live_auth_to_profile_snapshot "$profile_name"
+    report_touch_token_change "$profile_name" "$before_auth" "$(profile_auth_path "$profile_name")" >&2
+  else
+    status=$?
+    cat "$codex_output" >&2
+  fi
+  rm -f "$codex_output" "$before_auth"
+  rm -rf "$tmp_dir"
+  return "$status"
+}
+
+touch_command() {
+  ensure_dirs
+  local target=${1:-}
+  [[ -n "$target" ]] || die "Usage: codex-auth touch <name>|--all"
+  local -a targets=()
+  local name
+  if [[ "$target" == "--all" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      targets+=("$name")
+    done < <(list_profile_names)
+  else
+    validate_profile_name "$target"
+    [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+    targets+=("$target")
+  fi
+  (( ${#targets[@]} > 0 )) || die "No saved profiles to touch"
+  for name in "${targets[@]}"; do
+    [[ -f "$(profile_auth_path "$name")" ]] || die "Profile '$name' is missing auth.json"
+  done
+  require_cmd codex
+
+  local touch_lock_dir="$ACCOUNTS_DIR/touch.lock"
+  if ! mkdir "$touch_lock_dir" 2>/dev/null; then
+    die "Another codex-auth touch operation is already running (lock: $touch_lock_dir)"
+  fi
+
+  local original_name=""
+  original_name=$(find_matching_profile || true)
+  local original_auth_backup original_marker_backup had_auth=0 had_marker=0
+  original_auth_backup=$(mktemp)
+  original_marker_backup=$(mktemp)
+  if [[ -f "$AUTH_FILE" ]]; then
+    cp "$AUTH_FILE" "$original_auth_backup"
+    had_auth=1
+  fi
+  if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
+    cp "$CURRENT_PROFILE_FILE" "$original_marker_backup"
+    had_marker=1
+  fi
+
+  local failure_count=0
+  for name in "${targets[@]}"; do
+    if touch_one_profile "$name"; then
+      note "Touched '$name'"
+    else
+      failure_count=$((failure_count + 1))
+      note "Touch failed for '$name'"
+    fi
+  done
+
+  if [[ -n "$original_name" && -d "$(profile_dir "$original_name")" ]]; then
+    switch_profile "$original_name" >/dev/null 2>&1
+    note "Restored profile '$original_name'"
+  else
+    if [[ $had_auth -eq 1 ]]; then
+      mkdir -p "$CODEX_HOME"
+      cp "$original_auth_backup" "$AUTH_FILE"
+    fi
+    if [[ $had_marker -eq 1 ]]; then
+      mkdir -p "$ACCOUNTS_DIR"
+      cp "$original_marker_backup" "$CURRENT_PROFILE_FILE"
+    else
+      rm -f "$CURRENT_PROFILE_FILE"
+    fi
+    note "Restored original Codex auth state"
+  fi
+  rm -f "$original_auth_backup" "$original_marker_backup"
+  rm -rf "$touch_lock_dir"
+
+  (( failure_count == 0 ))
+}
+
 resolve_current_executable_path() {
   local script_ref=${1:-${BASH_SOURCE[0]:-$0}}
   python3 - "$script_ref" <<'PY'
@@ -2151,6 +2534,37 @@ main() {
         shift
       done
       refresh_usage_command "$refresh_target" "$refresh_use_utc" "$refresh_include_stats"
+      ;;
+    token-status)
+      shift
+      local token_status_target=""
+      local token_status_use_utc=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --utc)
+            [[ $token_status_use_utc -eq 0 ]] || die "Usage: codex-auth token-status [--utc] [<name>|--all]"
+            token_status_use_utc=1
+            ;;
+          --all)
+            [[ -z "$token_status_target" ]] || die "Usage: codex-auth token-status [--utc] [<name>|--all]"
+            token_status_target="--all"
+            ;;
+          -*)
+            die "Usage: codex-auth token-status [--utc] [<name>|--all]"
+            ;;
+          *)
+            [[ -z "$token_status_target" ]] || die "Usage: codex-auth token-status [--utc] [<name>|--all]"
+            token_status_target="$1"
+            ;;
+        esac
+        shift
+      done
+      token_status_command "$token_status_target" "$token_status_use_utc"
+      ;;
+    touch)
+      shift
+      [[ $# -eq 1 ]] || die "Usage: codex-auth touch <name>|--all"
+      touch_command "$1"
       ;;
     update)
       shift
