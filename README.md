@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.8.0`
+Current version: `0.9.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -18,6 +18,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
 - Inspect saved ID/access token expiration metadata with `token-status`
 - Touch one or all profiles with a minimal Codex request, save the live auth snapshot, and report whether Codex rotated the tokens
+- Set up, list, and delete managed cron jobs that run scheduled profile touches
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
 
@@ -162,6 +163,10 @@ codex-auth token-status
 codex-auth token-status work --utc
 codex-auth touch work
 codex-auth touch --all
+codex-auth cron
+codex-auth cron setup
+codex-auth cron add --time 08:30 --yes
+codex-auth cron delete
 codex-auth stats
 codex-auth stats --period 7d
 codex-auth stats --recompute
@@ -193,6 +198,21 @@ Run `codex-auth help` for the full command reference.
 - Codex does not necessarily rotate tokens on every touch. If the current access token is still acceptable to Codex, `touch` can complete successfully and report that tokens were unchanged.
 - Touching profiles consumes a small amount of Codex usage because it sends a real request.
 
+### Scheduled touch cron jobs
+
+- The cron commands require a working user `crontab` command on the machine where you schedule the job.
+- `codex-auth cron` or `codex-auth cron list` shows cron jobs managed by this tool.
+- `codex-auth cron setup` starts an interactive wizard. It lists existing managed jobs, asks whether to touch all profiles or one profile, asks for a daily or custom schedule, previews the exact cron fields and command, and then asks for confirmation. If `whiptail` is available in an interactive terminal, the wizard uses that dialog UI; otherwise it falls back to colored numbered prompts with readline-style editing where Bash supports it.
+- `codex-auth cron add --time 08:30 --yes` installs a daily scheduled `touch --all` job without prompts.
+- `codex-auth cron add --time 07:15 --profile work --yes` schedules a single profile every day.
+- `codex-auth cron add --schedule "30 8 * * 1,3,5" --yes` uses a custom cron expression, such as Monday/Wednesday/Friday at 08:30.
+- `codex-auth cron delete` lets you choose a managed job to remove; `codex-auth cron delete --all --yes` removes every codex-auth-managed touch job.
+- Cron entries are wrapped in `# BEGIN codex-auth touch ...` / `# END codex-auth touch ...` markers, so delete/list operations only manage jobs created by `codex-auth`.
+- Scheduled touch output is appended to `~/.codex/accounts/cron/touch.log` by default. The cron runner prints timestamped start/end lines around the normal `touch` output.
+- Generated jobs call `codex-auth cron run ...` instead of `touch` directly so logs include the managed job id, start/end timestamps, and final exit status without making the crontab line itself more complex.
+- If you use a non-default `CODEX_HOME`, the generated cron command preserves it. The generated command also sets a minimal `PATH` containing the resolved `codex` executable's directory, which helps cron run `codex` installations from tools like `nvm` without depending on your interactive shell startup files.
+- Set `CODEX_AUTH_DISABLE_WHIPTAIL=1` if you prefer the plain numbered cron setup prompts even when `whiptail` is installed.
+
 ### Session statistics
 
 - `codex-auth list --with-stats` adds a compact two-line footer with global local-session usage for **today** and **7d** when rollout history exists.
@@ -208,9 +228,9 @@ Run `codex-auth help` for the full command reference.
 
 The repo includes `completions/codex-auth.bash`, which enables tab completion for:
 
-- top-level commands such as `list`, `switch`, `refresh-usage`, `refresh`, `token-status`, `touch`, and `update`
+- top-level commands such as `list`, `switch`, `refresh-usage`, `refresh`, `token-status`, `touch`, `cron`, and `update`
 - saved profile names read from `~/.codex/accounts/profiles`
-- `--all`, `--utc`, `--with-stats`, `--period`, and `--recompute` for the relevant commands
+- `--all`, `--utc`, `--with-stats`, `--period`, `--recompute`, and cron flags such as `--time`, `--schedule`, `--profile`, and `--yes` for the relevant commands
 
 ### Linux
 
@@ -239,12 +259,13 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 - Session statistics parse rollout JSONL files under `~/.codex/sessions`
 - Pricing for session cost estimates is cached under `~/.codex/accounts/pricing-cache.json` for one week by default
 - Parsed session statistics are cached under `~/.codex/accounts/session-stats-cache.json` by default
+- Scheduled touch logs are written under `~/.codex/accounts/cron/touch.log` by default
 - Terminal colors are enabled automatically on color-capable terminals and can be disabled with `NO_COLOR=1`
 - This project is intentionally small and practical; the code favors usefulness over ceremony
 
 ## Smoke tests
 
-- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, timezone-aware list output, and refresh/list workflows.
+- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, timezone-aware list output, refresh/list workflows, touch behavior, and managed cron setup.
 - GitHub Actions runs that smoke test on Ubuntu and macOS for pushes and pull requests.
 
 ## License

@@ -9,6 +9,10 @@ _codex_auth_profile_names() {
   done
 }
 
+_codex_auth_cron_job_ids() {
+  crontab -l 2>/dev/null | sed -n 's/^# BEGIN codex-auth touch //p'
+}
+
 _codex_auth_completion() {
   local cur prev first
   COMPREPLY=()
@@ -16,9 +20,50 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage refresh token-status touch stats statistics update rename remove rm delete help"
+  local commands="list current save switch add refresh-usage refresh token-status touch cron stats statistics update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
+
+  if [[ "$first" == "cron" ]]; then
+    local subcmd="${COMP_WORDS[2]:-}"
+    local cron_jobs
+    cron_jobs="$(_codex_auth_cron_job_ids | tr '\n' ' ')"
+
+    if [[ "$COMP_CWORD" -eq 2 ]]; then
+      COMPREPLY=( $(compgen -W "list setup add delete remove rm run help" -- "$cur") )
+      return 0
+    fi
+
+    case "$subcmd" in
+      add)
+        case "$prev" in
+          --profile)
+            COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+            return 0
+            ;;
+          --time|--schedule|--id)
+            return 0
+            ;;
+        esac
+        COMPREPLY=( $(compgen -W "--time --daily --schedule --all --profile --id --yes -y" -- "$cur") )
+        return 0
+        ;;
+      delete|remove|rm)
+        COMPREPLY=( $(compgen -W "--all --yes -y $cron_jobs" -- "$cur") )
+        return 0
+        ;;
+      run)
+        if [[ "$COMP_CWORD" -eq 3 ]]; then
+          COMPREPLY=( $(compgen -W "$cron_jobs" -- "$cur") )
+          return 0
+        fi
+        COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+        return 0
+        ;;
+    esac
+
+    return 0
+  fi
 
   case "$prev" in
     save|switch|add|remove|rm|delete)

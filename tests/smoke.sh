@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.8.0"
+EXPECTED_VERSION="0.9.0"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -43,6 +43,79 @@ case "${1:-}" in
 esac
 SCRIPT
   chmod +x "$dir/codex"
+  printf '%s\n' "$dir"
+}
+
+make_fake_crontab_dir() {
+  local dir
+  dir=$(mktemp -d)
+  cat > "$dir/crontab" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+crontab_file=${CODEX_AUTH_FAKE_CRONTAB_FILE:?}
+case "${1:-}" in
+  -l)
+    [[ $# -eq 1 ]] || exit 2
+    [[ -f "$crontab_file" ]] || exit 1
+    cat "$crontab_file"
+    ;;
+  "")
+    exit 2
+    ;;
+  *)
+    [[ $# -eq 1 ]] || exit 2
+    cp "$1" "$crontab_file"
+    ;;
+esac
+SCRIPT
+  chmod +x "$dir/crontab"
+  printf '%s\n' "$dir"
+}
+
+make_failing_crontab_dir() {
+  local dir
+  dir=$(mktemp -d)
+  cat > "$dir/crontab" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "-l" ]]; then
+  echo "permission denied reading crontab" >&2
+  exit 1
+fi
+exit 2
+SCRIPT
+  chmod +x "$dir/crontab"
+  printf '%s\n' "$dir"
+}
+
+make_stub_whiptail_dir() {
+  local dir
+  dir=$(mktemp -d)
+  cat > "$dir/whiptail" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${CODEX_AUTH_WHIPTAIL_LOG:?}"
+args=" $* "
+if [[ "$args" == *" --menu "* ]]; then
+  if [[ "$args" == *"Touch target"* ]]; then
+    printf 'all\n' >&2
+  elif [[ "$args" == *"Schedule"* ]]; then
+    printf 'custom\n' >&2
+  else
+    printf 'all\n' >&2
+  fi
+  exit 0
+fi
+if [[ "$args" == *" --inputbox "* ]]; then
+  printf '30 8 * * 1,3,5\n' >&2
+  exit 0
+fi
+if [[ "$args" == *" --yesno "* ]]; then
+  exit 0
+fi
+exit 0
+SCRIPT
+  chmod +x "$dir/whiptail"
   printf '%s\n' "$dir"
 }
 
@@ -300,6 +373,7 @@ test_help_mentions_refresh_alias_and_utc_flag() {
   assert_contains "$output" "refresh [--utc] [--with-stats] [<name>|--all]"
   assert_contains "$output" "token-status [--utc] [<name>|--all]"
   assert_contains "$output" "touch <name>|--all"
+  assert_contains "$output" "cron [list|setup|add|delete|run]"
   assert_contains "$output" "list [--utc] [--with-stats]"
   assert_contains "$output" "current [--utc]"
 }
@@ -397,12 +471,16 @@ test_completion_lists_update_command() {
   assert_contains "$completion" "refresh"
   assert_contains "$completion" "token-status"
   assert_contains "$completion" "touch"
+  assert_contains "$completion" "cron"
   assert_contains "$completion" "stats"
   assert_contains "$completion" "statistics"
   assert_contains "$completion" "--utc"
   assert_contains "$completion" "--period"
   assert_contains "$completion" "--with-stats"
   assert_contains "$completion" "--recompute"
+  assert_contains "$completion" "--time"
+  assert_contains "$completion" "--schedule"
+  assert_not_contains "$completion" "--weekdays"
 }
 
 test_save_tracks_id_and_access_token_expiry_in_meta() {
@@ -561,6 +639,232 @@ test_touch_refuses_to_run_when_touch_lock_exists() {
 
   [[ $status -ne 0 ]] || fail "expected touch to fail when another touch lock exists"
   assert_contains "$output" "Another codex-auth touch operation is already running"
+}
+
+test_cron_add_lists_and_deletes_managed_touch_job() {
+  local home_dir stub_codex_dir fake_crontab_dir crontab_file output list_output delete_output crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  printf '# unmanaged user job\n5 4 * * * echo keep\n' > "$crontab_file"
+
+  output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --time 08:30 --yes 2>&1)
+
+  assert_contains "$output" "Installed codex-auth touch cron job 'daily-0830-all'"
+  assert_contains "$output" "Cron: 30 8 * * *"
+  assert_contains "$output" "Touch command: codex-auth touch --all"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# unmanaged user job"
+  assert_contains "$crontab_body" "# BEGIN codex-auth touch daily-0830-all"
+  assert_contains "$crontab_body" "# schedule: daily at 08:30"
+  assert_contains "$crontab_body" "# target: --all"
+  assert_contains "$crontab_body" "30 8 * * *"
+  assert_contains "$crontab_body" "cron run daily-0830-all --all"
+  assert_contains "$crontab_body" "CODEX_HOME="
+  assert_contains "$crontab_body" "PATH="
+  assert_not_contains "$crontab_body" "CODEX_AUTH_CODEX_BIN="
+  assert_contains "$crontab_body" "touch.log"
+  assert_contains "$crontab_body" "# END codex-auth touch daily-0830-all"
+
+  list_output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron list)
+  assert_contains "$list_output" "CODEX-AUTH TOUCH CRON JOBS"
+  assert_contains "$list_output" "daily-0830-all"
+  assert_contains "$list_output" "daily at 08:30"
+  assert_contains "$list_output" "all profiles"
+
+  delete_output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron delete daily-0830-all --yes 2>&1)
+  assert_contains "$delete_output" "Deleted codex-auth touch cron job 'daily-0830-all'"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# unmanaged user job"
+  assert_not_contains "$crontab_body" "daily-0830-all"
+}
+
+test_cron_command_keeps_codex_symlink_directory_in_path() {
+  local home_dir fake_crontab_dir crontab_file command_dir real_dir output crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  command_dir=$(mktemp -d)
+  real_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cat > "$real_dir/codex.js" <<'SCRIPT'
+#!/usr/bin/env node
+SCRIPT
+  chmod +x "$real_dir/codex.js"
+  ln -s "$real_dir/codex.js" "$command_dir/codex"
+
+  output=$(PATH="$fake_crontab_dir:$command_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --time 08:30 --yes 2>&1)
+
+  assert_contains "$output" "Installed codex-auth touch cron job 'daily-0830-all'"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "PATH=$command_dir:"
+  assert_not_contains "$crontab_body" "PATH=$real_dir:"
+  assert_not_contains "$crontab_body" "CODEX_AUTH_CODEX_BIN="
+}
+
+test_cron_refuses_to_overwrite_when_crontab_cannot_be_read() {
+  local home_dir stub_codex_dir failing_crontab_dir output status=0
+  home_dir=$(mktemp -d)
+  stub_codex_dir=$(make_stub_codex_dir)
+  failing_crontab_dir=$(make_failing_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(PATH="$failing_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --time 08:30 --yes 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected cron add to fail when the current crontab cannot be read"
+  assert_contains "$output" "permission denied reading crontab"
+  assert_not_contains "$output" "Installed codex-auth touch cron job"
+}
+
+test_cron_delete_preserves_unrelated_lines_after_malformed_managed_block() {
+  local home_dir stub_codex_dir fake_crontab_dir crontab_file output status=0 crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cat > "$crontab_file" <<'CRON'
+# BEGIN codex-auth touch broken-job
+# schedule: daily at 08:30
+30 8 * * * echo broken
+5 4 * * * echo keep
+CRON
+
+  output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron delete broken-job --yes 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected malformed managed block deletion to fail safely"
+  assert_contains "$output" "No matching codex-auth touch cron job found"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "echo broken"
+  assert_contains "$crontab_body" "echo keep"
+}
+
+test_cron_add_supports_specific_profile_and_custom_schedule() {
+  local home_dir stub_codex_dir fake_crontab_dir crontab_file output crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --time 07:15 --profile alpha --yes 2>&1)
+
+  assert_contains "$output" "Installed codex-auth touch cron job 'daily-0715-alpha'"
+  assert_contains "$output" "Cron: 15 7 * * *"
+  assert_contains "$output" "Touch command: codex-auth touch alpha"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# schedule: daily at 07:15"
+  assert_contains "$crontab_body" "# target: alpha"
+  assert_contains "$crontab_body" "15 7 * * *"
+  assert_contains "$crontab_body" "cron run daily-0715-alpha alpha"
+
+  output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --schedule "30 8 * * 1,3,5" --id mwf-0830 --yes 2>&1)
+  assert_contains "$output" "Installed codex-auth touch cron job 'mwf-0830'"
+  assert_contains "$output" "30 8 * * 1,3,5"
+  assert_contains "$output" "Touch command: codex-auth touch --all"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# schedule: custom: 30 8 * * 1,3,5"
+  assert_contains "$crontab_body" "# BEGIN codex-auth touch mwf-0830"
+}
+
+test_cron_setup_wizard_installs_default_daily_all_job() {
+  local home_dir stub_codex_dir fake_crontab_dir crontab_file output crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(printf '\n\n09:05\n\n' | PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron setup 2>&1)
+
+  assert_contains "$output" "No codex-auth touch cron jobs found."
+  assert_contains "$output" "Touch target"
+  assert_contains "$output" "Schedule"
+  assert_contains "$output" "Daily at a time"
+  assert_contains "$output" "Custom cron expression"
+  assert_not_contains "$output" "Weekdays"
+  assert_contains "$output" "Cron: 5 9 * * *"
+  assert_contains "$output" "Installed codex-auth touch cron job 'daily-0905-all'"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# BEGIN codex-auth touch daily-0905-all"
+  assert_contains "$crontab_body" "5 9 * * *"
+  assert_contains "$crontab_body" "cron run daily-0905-all --all"
+}
+
+test_cron_setup_wizard_supports_whiptail_when_available() {
+  local home_dir stub_codex_dir fake_crontab_dir stub_whiptail_dir crontab_file whiptail_log output crontab_body
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  whiptail_log=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  stub_whiptail_dir=$(make_stub_whiptail_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(PATH="$stub_whiptail_dir:$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" CODEX_AUTH_FORCE_WHIPTAIL=1 CODEX_AUTH_WHIPTAIL_LOG="$whiptail_log" /bin/bash "$ROOT_DIR/bin/codex-auth" cron setup 2>&1)
+
+  assert_contains "$output" "30 8 * * 1,3,5"
+  assert_contains "$output" "Installed codex-auth touch cron job 'custom-all'"
+  assert_contains "$(cat "$whiptail_log")" "--menu Touch target"
+  assert_contains "$(cat "$whiptail_log")" "--menu Schedule"
+  assert_contains "$(cat "$whiptail_log")" "--inputbox"
+  assert_contains "$(cat "$whiptail_log")" "--yesno"
+  crontab_body=$(cat "$crontab_file")
+  assert_contains "$crontab_body" "# schedule: custom: 30 8 * * 1,3,5"
+  assert_contains "$crontab_body" "cron run custom-all --all"
+}
+
+test_cron_setup_numbered_fallback_uses_color_when_forced() {
+  local home_dir stub_codex_dir fake_crontab_dir crontab_file output
+  home_dir=$(mktemp -d)
+  crontab_file=$(mktemp)
+  stub_codex_dir=$(make_stub_codex_dir)
+  fake_crontab_dir=$(make_fake_crontab_dir)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(printf '\n\n09:10\n\n' | PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" CODEX_AUTH_FORCE_COLOR=1 CODEX_AUTH_DISABLE_WHIPTAIL=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron setup 2>&1)
+
+  assert_contains "$output" $'\033['
+  assert_contains "$output" "Touch target"
+  assert_contains "$output" "Schedule"
+  assert_contains "$output" "Installed codex-auth touch cron job 'daily-0910-all'"
+}
+
+test_cron_run_prints_timestamps_and_invokes_touch() {
+  local home_dir stub_dir output log_file
+  home_dir=$(mktemp -d)
+  stub_dir=$(mktemp -d)
+  log_file="$stub_dir/codex.log"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+  cat > "$stub_dir/codex" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CODEX_STUB_LOG"
+if [[ "${1:-}" == "exec" ]]; then
+  printf 'hi\n'
+fi
+SCRIPT
+  chmod +x "$stub_dir/codex"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" CODEX_STUB_LOG="$log_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron run manual-test alpha 2>&1)
+
+  assert_contains "$output" "START codex-auth touch alpha (job=manual-test)"
+  assert_contains "$output" "Touching alpha"
+  assert_contains "$output" "Tokens unchanged for 'alpha'"
+  assert_contains "$output" "END codex-auth touch alpha (job=manual-test status=0)"
+  assert_contains "$(cat "$log_file")" "exec"
+}
+
+test_cron_implementation_avoids_nonportable_bash_and_date_flags() {
+  local script
+  script=$(cat "$ROOT_DIR/bin/codex-auth")
+  assert_not_contains "$script" "read -e -r -i"
+  assert_not_contains "$script" "date -Is"
 }
 
 test_remote_style_install_works_without_from_flag() {
@@ -1046,6 +1350,16 @@ main() {
   test_touch_profile_runs_minimal_codex_exec_saves_token_and_restores_current_profile
   test_touch_reports_when_codex_does_not_rotate_tokens
   test_touch_refuses_to_run_when_touch_lock_exists
+  test_cron_add_lists_and_deletes_managed_touch_job
+  test_cron_command_keeps_codex_symlink_directory_in_path
+  test_cron_refuses_to_overwrite_when_crontab_cannot_be_read
+  test_cron_delete_preserves_unrelated_lines_after_malformed_managed_block
+  test_cron_add_supports_specific_profile_and_custom_schedule
+  test_cron_setup_wizard_installs_default_daily_all_job
+  test_cron_setup_wizard_supports_whiptail_when_available
+  test_cron_setup_numbered_fallback_uses_color_when_forced
+  test_cron_run_prints_timestamps_and_invokes_touch
+  test_cron_implementation_avoids_nonportable_bash_and_date_flags
   test_list_skips_session_stats_by_default_and_with_stats_opts_in
   test_refresh_with_stats_flag_includes_session_footer
   test_stats_reports_overview_daily_and_model_breakdown

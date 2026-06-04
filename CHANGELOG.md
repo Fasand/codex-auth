@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.9.0 - 2026-06-04
+
+- Added `cron` commands to list, set up, add, delete, and run managed scheduled `touch` jobs.
+- Added an interactive `cron setup` wizard for daily or custom touch schedules, using `whiptail` when available and colored numbered prompts as a fallback.
+- Added timestamped scheduled-touch logging under `~/.codex/accounts/cron/touch.log` and managed crontab markers for safe deletion.
+
 ## 0.8.0 - 2026-06-04
 
 - Added `token-status` to inspect saved profile ID-token and access-token expirations without changing the main profile list; it defaults to all profiles and uses the same active marker/color style as `list`.
