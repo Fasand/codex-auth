@@ -683,7 +683,7 @@ test_cron_add_lists_and_deletes_managed_touch_job() {
 }
 
 test_cron_command_keeps_codex_symlink_directory_in_path() {
-  local home_dir fake_crontab_dir crontab_file command_dir real_dir output crontab_body
+  local home_dir fake_crontab_dir crontab_file command_dir command_dir_physical real_dir real_dir_physical output crontab_body
   home_dir=$(mktemp -d)
   crontab_file=$(mktemp)
   fake_crontab_dir=$(make_fake_crontab_dir)
@@ -695,13 +695,15 @@ test_cron_command_keeps_codex_symlink_directory_in_path() {
 SCRIPT
   chmod +x "$real_dir/codex.js"
   ln -s "$real_dir/codex.js" "$command_dir/codex"
+  command_dir_physical=$(CDPATH= cd -- "$command_dir" && pwd -P)
+  real_dir_physical=$(CDPATH= cd -- "$real_dir" && pwd -P)
 
   output=$(PATH="$fake_crontab_dir:$command_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --time 08:30 --yes 2>&1)
 
   assert_contains "$output" "Installed codex-auth touch cron job 'daily-0830-all'"
   crontab_body=$(cat "$crontab_file")
-  assert_contains "$crontab_body" "PATH=$command_dir:"
-  assert_not_contains "$crontab_body" "PATH=$real_dir:"
+  assert_contains "$crontab_body" "PATH=$command_dir_physical:"
+  assert_not_contains "$crontab_body" "PATH=$real_dir_physical:"
   assert_not_contains "$crontab_body" "CODEX_AUTH_CODEX_BIN="
 }
 
