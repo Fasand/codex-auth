@@ -16,13 +16,17 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage refresh stats statistics update rename remove rm delete help"
+  local commands="list current save switch add refresh-usage refresh token-status touch stats statistics update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
 
   case "$prev" in
     save|switch|add|remove|rm|delete)
       COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
+      return 0
+      ;;
+    touch)
+      COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
       return 0
       ;;
     list)
@@ -35,6 +39,10 @@ _codex_auth_completion() {
       ;;
     refresh-usage|refresh)
       COMPREPLY=( $(compgen -W "--all --utc --with-stats $profiles" -- "$cur") )
+      return 0
+      ;;
+    token-status)
+      COMPREPLY=( $(compgen -W "--all --utc $profiles" -- "$cur") )
       return 0
       ;;
     stats|statistics)
@@ -50,6 +58,10 @@ _codex_auth_completion() {
     --utc)
       if [[ "$first" == "refresh-usage" || "$first" == "refresh" ]]; then
         COMPREPLY=( $(compgen -W "--all --with-stats --utc $profiles" -- "$cur") )
+        return 0
+      fi
+      if [[ "$first" == "token-status" ]]; then
+        COMPREPLY=( $(compgen -W "--all --utc $profiles" -- "$cur") )
         return 0
       fi
       if [[ "$first" == "list" ]]; then
@@ -84,6 +96,11 @@ _codex_auth_completion() {
       COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
       return 0
     fi
+    return 0
+  fi
+
+  if [[ "$first" == "touch" ]]; then
+    COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
     return 0
   fi
 

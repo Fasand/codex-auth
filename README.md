@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.7.0`
+Current version: `0.8.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -16,6 +16,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Optionally show a compact global session-usage footer in `list`
 - Inspect historical local session statistics with `stats`
 - Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
+- Inspect saved ID/access token expiration metadata with `token-status`
+- Touch one or all profiles with a minimal Codex request, save the live auth snapshot, and report whether Codex rotated the tokens
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
 
@@ -156,6 +158,10 @@ codex-auth save work
 codex-auth switch work
 codex-auth refresh-usage
 codex-auth refresh work --with-stats
+codex-auth token-status
+codex-auth token-status work --utc
+codex-auth touch work
+codex-auth touch --all
 codex-auth stats
 codex-auth stats --period 7d
 codex-auth stats --recompute
@@ -173,10 +179,19 @@ Run `codex-auth help` for the full command reference.
 
 ### Refresh behavior
 
+- `codex-auth refresh-usage` and `codex-auth refresh` refresh **usage data** from ChatGPT Codex usage endpoints. They do not perform a Codex OAuth token refresh by themselves.
 - `codex-auth refresh-usage` or `codex-auth refresh` with no profile name asks for confirmation before refreshing every saved profile.
 - Multi-profile refreshes show progress as each profile is processed; interactive terminals use a single live-updating line, while non-interactive output stays line-based.
 - If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
 - Refresh prints the updated profile list quickly by default. Pass `--with-stats` if you also want the slower local-session usage footer after the refresh.
+
+### Token status and touch
+
+- `codex-auth token-status [profile|--all]` shows saved ID-token and access-token expirations, last refresh time, and whether a refresh token is present. With no profile name, it lists all saved profiles.
+- `codex-auth touch <profile>|--all` switches to each target profile, runs a minimal non-interactive `codex exec` prompt in a temporary empty directory, saves the live `auth.json` back to that profile, reports whether the ID/access tokens actually changed, and then restores the profile that was active before the touch.
+- The touch command uses `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--skip-git-repo-check`, and a read-only sandbox to keep the request small and avoid loading MCP/user/project customizations.
+- Codex does not necessarily rotate tokens on every touch. If the current access token is still acceptable to Codex, `touch` can complete successfully and report that tokens were unchanged.
+- Touching profiles consumes a small amount of Codex usage because it sends a real request.
 
 ### Session statistics
 
@@ -193,7 +208,7 @@ Run `codex-auth help` for the full command reference.
 
 The repo includes `completions/codex-auth.bash`, which enables tab completion for:
 
-- top-level commands such as `list`, `switch`, `refresh-usage`, `refresh`, and `update`
+- top-level commands such as `list`, `switch`, `refresh-usage`, `refresh`, `token-status`, `touch`, and `update`
 - saved profile names read from `~/.codex/accounts/profiles`
 - `--all`, `--utc`, `--with-stats`, `--period`, and `--recompute` for the relevant commands
 
@@ -219,7 +234,8 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 
 - Profiles are stored under `~/.codex/accounts/profiles`
 - The active auth file remains `~/.codex/auth.json`
-- Usage refresh talks to ChatGPT Codex usage endpoints using the saved auth token
+- Usage refresh talks to ChatGPT Codex usage endpoints using the saved access token
+- Saved profile metadata tracks both ID-token and access-token expirations
 - Session statistics parse rollout JSONL files under `~/.codex/sessions`
 - Pricing for session cost estimates is cached under `~/.codex/accounts/pricing-cache.json` for one week by default
 - Parsed session statistics are cached under `~/.codex/accounts/session-stats-cache.json` by default
