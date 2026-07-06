@@ -2,6 +2,8 @@
 
 Small CLI for saving, switching, listing, and refreshing multiple ChatGPT Codex auth profiles.
 
+The versioning/tag/changelog rules below are the canonical copy for this repo; the workspace-wide generalization lives in `~/Developer/reference-architecture/conventions/releases.md`.
+
 ## Working rules
 
 - Do not work directly on `main`.
