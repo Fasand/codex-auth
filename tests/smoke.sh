@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 EXPECTED_VERSION="0.10.0"
 
+# Keep the daily update check inert for every test; update-check tests
+# re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
+export CODEX_AUTH_NO_UPDATE_CHECK=1
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -924,6 +928,70 @@ test_update_command_reuses_the_installer_without_cloning() {
   [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
 }
 
+test_update_check_prompts_once_and_declining_runs_command() {
+  local home_dir remote_dir output
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list 2>&1)
+  assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "PROFILE"
+  [[ -f "$home_dir/accounts/update-check" ]] || fail "expected update-check cache to be written"
+
+  # Within the TTL window the check is skipped entirely.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list < /dev/null 2>&1)
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+}
+
+test_update_check_failures_never_block_the_command() {
+  local home_dir output status=0
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file:///nonexistent-codex-auth-remote" /bin/bash "$ROOT_DIR/bin/codex-auth" list < /dev/null 2>&1) || status=$?
+  [[ $status -eq 0 ]] || fail "expected list to succeed when the update check cannot reach the remote"
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+  [[ -f "$home_dir/accounts/update-check" ]] || fail "expected failed check attempt to be cached to avoid retry storms"
+}
+
+test_update_check_skipped_when_not_interactive() {
+  local home_dir remote_dir output
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list 2>&1)
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+  [[ ! -f "$home_dir/accounts/update-check" ]] || fail "expected no update-check cache for non-interactive runs"
+}
+
+test_update_check_accepting_updates_and_skips_the_command() {
+  local prefix stub_codex_dir remote_dir home_dir output
+  prefix=$(mktemp -d)
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  stub_codex_dir=$(make_stub_codex_dir)
+  mkdir -p "$remote_dir/bin" "$remote_dir/completions"
+  sed 's/^APP_VERSION=.*/APP_VERSION="9.9.9"/' "$ROOT_DIR/bin/codex-auth" > "$remote_dir/bin/codex-auth"
+  cp "$ROOT_DIR/install.sh" "$remote_dir/install.sh"
+  cp "$ROOT_DIR/completions/codex-auth.bash" "$remote_dir/completions/codex-auth.bash"
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
+
+  output=$(printf '\n' | PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" "$prefix/bin/codex-auth" list 2>&1)
+  assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "Re-run your command"
+  assert_not_contains "$output" "PROFILE"
+  [[ "$("$prefix/bin/codex-auth" --version)" == "9.9.9" ]] || fail "expected updated binary to report 9.9.9, got: $("$prefix/bin/codex-auth" --version)"
+}
+
 test_list_works_with_minimal_path() {
   local home_dir stub_dir output
   home_dir=$(mktemp -d)
@@ -1494,6 +1562,10 @@ main() {
   test_remote_style_install_works_without_from_flag
   test_re_running_the_installer_updates_in_place
   test_update_command_reuses_the_installer_without_cloning
+  test_update_check_prompts_once_and_declining_runs_command
+  test_update_check_failures_never_block_the_command
+  test_update_check_skipped_when_not_interactive
+  test_update_check_accepting_updates_and_skips_the_command
   test_list_works_with_minimal_path
   test_list_uses_local_timezone_by_default_and_utc_when_requested
   test_list_groups_profiles_with_refresh_errors_at_the_end

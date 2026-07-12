@@ -4,6 +4,7 @@ Newest releases go at the top.
 
 ## 0.10.0 - 2026-07-12
 
+- Added a daily automatic update check for installed copies: the first interactive command of the day compares against the published `VERSION` and offers `Update now? [Y/n]`; accepting updates in place and skips the original command. Non-interactive runs, cron jobs, local checkouts, and any network failure silently skip the check (`CODEX_AUTH_NO_UPDATE_CHECK=1` opts out).
 - Made bare `refresh-usage` / `refresh` refresh all saved profiles directly, without the confirmation prompt (DEV-137).
 - Marked usage percentages that did not come straight from the primary usage endpoint with a `~` prefix, so numbers backfilled from local session snapshots or fetched from the fallback endpoint can no longer masquerade as live data (fixes the flip-flopping `refresh` readings).
 - Ignored local session snapshots older than one hour when backfilling usage, since rollout files carry no account identity and stale windows can describe a different login.

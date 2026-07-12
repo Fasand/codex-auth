@@ -20,6 +20,8 @@ DEFAULT_PRICING_URL="${CODEX_AUTH_PRICING_URL:-https://developers.openai.com/api
 DEFAULT_PRICING_CACHE_PATH="${CODEX_AUTH_PRICING_CACHE_PATH:-$ACCOUNTS_DIR/pricing-cache.json}"
 DEFAULT_PRICING_CACHE_TTL_SECONDS="${CODEX_AUTH_PRICING_CACHE_TTL_SECONDS:-604800}"
 DEFAULT_SESSION_STATS_CACHE_PATH="${CODEX_AUTH_SESSION_STATS_CACHE_PATH:-$ACCOUNTS_DIR/session-stats-cache.json}"
+DEFAULT_UPDATE_CHECK_CACHE_PATH="${CODEX_AUTH_UPDATE_CHECK_CACHE_PATH:-$ACCOUNTS_DIR/update-check}"
+DEFAULT_UPDATE_CHECK_TTL_SECONDS="${CODEX_AUTH_UPDATE_CHECK_TTL_SECONDS:-86400}"
 export CODEX_AUTH_THEME_HEADER_STYLE="${CODEX_AUTH_THEME_HEADER_STYLE:-1;97}"
 export CODEX_AUTH_THEME_ACTIVE_STYLE="${CODEX_AUTH_THEME_ACTIVE_STYLE:-1;93}"
 export CODEX_AUTH_THEME_PROFILE_STYLE="${CODEX_AUTH_THEME_PROFILE_STYLE:-36}"
@@ -79,6 +81,8 @@ Environment:
   CODEX_AUTH_CRON_LOG_FILE  Override scheduled touch log path
   CODEX_AUTH_CRON_PATH    Override PATH used by generated cron commands
   CODEX_AUTH_DISABLE_WHIPTAIL  Set to 1 to force numbered cron setup prompts
+  CODEX_AUTH_NO_UPDATE_CHECK  Set to 1 to disable the daily update check
+  CODEX_AUTH_UPDATE_CHECK_TTL_SECONDS  Override update-check interval (default: 86400)
 USAGE
 }
 
@@ -3539,8 +3543,104 @@ update_self() {
   fi
 }
 
+is_newer_version() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+current, candidate = sys.argv[1:3]
+
+
+def parse(value):
+    value = value.strip()
+    if not re.fullmatch(r'\d+(\.\d+)*', value):
+        return None
+    return tuple(int(part) for part in value.split('.'))
+
+
+cur = parse(current)
+cand = parse(candidate)
+if cur is None or cand is None:
+    raise SystemExit(1)
+raise SystemExit(0 if cand > cur else 1)
+PY
+}
+
+is_local_checkout() {
+  local script_path bin_dir parent_dir
+  script_path=$(resolve_current_executable_path "${BASH_SOURCE[0]:-$0}" 2>/dev/null) || return 1
+  bin_dir=$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd -P) || return 1
+  parent_dir=$(CDPATH= cd -- "$bin_dir/.." && pwd -P) || return 1
+  [[ -f "$parent_dir/install.sh" && -f "$parent_dir/bin/codex-auth" && -f "$parent_dir/completions/codex-auth.bash" ]]
+}
+
+update_check_due() {
+  local now ts rest
+  now=$(date +%s)
+  [[ -f "$DEFAULT_UPDATE_CHECK_CACHE_PATH" ]] || return 0
+  read -r ts rest < "$DEFAULT_UPDATE_CHECK_CACHE_PATH" 2>/dev/null || return 0
+  [[ "$ts" =~ ^[0-9]+$ ]] || return 0
+  (( now - ts >= DEFAULT_UPDATE_CHECK_TTL_SECONDS ))
+}
+
+# Daily best-effort update check. Prompts at most once per TTL window, only
+# in interactive terminals, and degrades to a no-op on any failure — the
+# wrapped command must never be blocked by this. Callers invoke it with
+# `|| true`; on an accepted update it exits without running the original
+# command (the new version should handle it).
+maybe_check_for_update() {
+  if [[ "${CODEX_AUTH_NO_UPDATE_CHECK:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${CODEX_AUTH_FORCE_UPDATE_CHECK:-0}" != "1" ]]; then
+    # Interactive sessions only: never prompt inside scripts, pipes, or cron.
+    [[ -t 0 && -t 2 ]] || return 0
+  fi
+  have_cmd curl || return 0
+  update_check_due || return 0
+  if [[ "${CODEX_AUTH_FORCE_UPDATE_CHECK:-0}" != "1" ]] && is_local_checkout; then
+    # `update` refuses to run in a local checkout; don't offer it.
+    return 0
+  fi
+
+  local from_base remote_version reply
+  from_base="${CODEX_AUTH_INSTALL_FROM:-$DEFAULT_INSTALL_FROM_BASE}"
+  from_base=${from_base%/}
+  remote_version=$(curl -fsSL --connect-timeout 2 --max-time 4 "$from_base/VERSION" 2>/dev/null | head -n 1 | tr -d '[:space:]') || remote_version=""
+  # Record the attempt (even a failed one) so an offline machine pays the
+  # network timeout at most once per TTL window.
+  mkdir -p "$(dirname "$DEFAULT_UPDATE_CHECK_CACHE_PATH")" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date +%s)" "${remote_version:-unknown}" > "$DEFAULT_UPDATE_CHECK_CACHE_PATH" 2>/dev/null || true
+  [[ -n "$remote_version" ]] || return 0
+  is_newer_version "$APP_VERSION" "$remote_version" || return 0
+
+  printf 'codex-auth %s is available (current %s). Update now? [Y/n] ' "$remote_version" "$APP_VERSION" >&2
+  reply=""
+  read -r reply || reply="n"
+  case "$reply" in
+    ""|y|Y|yes|YES|Yes)
+      if update_self; then
+        note "Updated to codex-auth $remote_version. Re-run your command."
+        exit 0
+      fi
+      note "Update failed — continuing with the current version."
+      ;;
+    *)
+      ;;
+  esac
+  return 0
+}
+
 main() {
   local cmd=${1:-help}
+  case "$cmd" in
+    help|-h|--help|version|-v|--version|update|cron)
+      # No update check for meta commands or cron-driven runs.
+      ;;
+    *)
+      maybe_check_for_update || true
+      ;;
+  esac
   case "$cmd" in
     help|-h|--help)
       usage
