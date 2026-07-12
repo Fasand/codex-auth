@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.9.0"
+APP_VERSION="0.10.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -47,7 +47,7 @@ Commands:
   switch [name]             Switch to a saved profile (interactive if name omitted)
   add <name>                Run codex login, then save the result as <name>
   refresh-usage [--utc] [--with-stats] [<name>|--all]
-                            Query live usage for one profile or, with no args, confirm refresh for all profiles
+                            Query live usage for one profile, or all profiles when no name is given
   refresh [--utc] [--with-stats] [<name>|--all]
                             Alias for refresh-usage
   token-status [--utc] [<name>|--all]
@@ -263,17 +263,91 @@ write_meta_file() {
   extract_meta_json "$profile_name" "$auth_path" > "$meta_path"
 }
 
+# Returns 0 only when the auth.json at $1 verifiably belongs to the same
+# account as the profile meta.json at $2 (account_id match, falling back to
+# email). Unverifiable identity counts as a mismatch, to keep callers from
+# cross-contaminating snapshots.
+live_auth_matches_profile() {
+  local auth_file=$1
+  local meta_path=$2
+  [[ -f "$auth_file" && -f "$meta_path" ]] || return 1
+  python3 - "$auth_file" "$meta_path" <<'PY'
+import base64
+import json
+import sys
+from pathlib import Path
+
+auth_path, meta_path = sys.argv[1:3]
+try:
+    auth = json.loads(Path(auth_path).read_text())
+    meta = json.loads(Path(meta_path).read_text())
+except Exception:
+    raise SystemExit(1)
+tokens = auth.get('tokens') or {}
+
+live_account = tokens.get('account_id') or ''
+meta_account = meta.get('accountId') or ''
+if live_account and meta_account:
+    raise SystemExit(0 if live_account == meta_account else 1)
+
+
+def jwt_claims(token):
+    if not isinstance(token, str) or '.' not in token:
+        return {}
+    parts = token.split('.')
+    if len(parts) < 2 or not parts[1]:
+        return {}
+    payload = parts[1] + '=' * (-len(parts[1]) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return {}
+
+
+live_email = jwt_claims(tokens.get('id_token')).get('email') or jwt_claims(tokens.get('access_token')).get('email') or ''
+meta_email = meta.get('email') or ''
+if live_email and meta_email:
+    raise SystemExit(0 if live_email == meta_email else 1)
+raise SystemExit(1)
+PY
+}
+
 latest_session_snapshot_json() {
   local sessions_dir=$1
   python3 - "$sessions_dir" <<'PY'
+import datetime as dt
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
 sessions_dir = Path(sys.argv[1])
 if not sessions_dir.exists():
     raise SystemExit(1)
+
+# Session snapshots older than this are ignored: rollout files carry no
+# account identity, so an old snapshot may describe a different login or a
+# long-gone rate-limit window.
+MAX_SNAPSHOT_AGE_SECONDS = 3600
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+now_utc = parse_iso(os.environ.get('CODEX_AUTH_NOW')) or dt.datetime.now(dt.timezone.utc)
 
 files = sorted(sessions_dir.glob('**/rollout-*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
 for path in files:
@@ -299,6 +373,9 @@ for path in files:
             context_used = int(round((float(total) / float(model_context_window)) * 100))
         except Exception:
             context_used = None
+        captured_at = parse_iso(obj.get('timestamp'))
+        if captured_at is None or (now_utc - captured_at).total_seconds() > MAX_SNAPSHOT_AGE_SECONDS:
+            raise SystemExit(1)
         rate_limits = payload.get('rate_limits') or {}
         primary = rate_limits.get('primary') or {}
         secondary = rate_limits.get('secondary') or {}
@@ -430,6 +507,9 @@ for url in urls:
                 'fetchedAt': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'source': 'live',
                 'url': url,
+                # The fallback endpoint may account usage against a different
+                # limit bucket; the display marks its numbers as approximate.
+                'endpoint': 'primary' if (custom_url or url == default_url) else 'fallback',
             }
             payload.update(data)
             payload['backend_derived'] = derived_from_backend(payload)
@@ -593,15 +673,36 @@ def format_percent(value):
         return str(value)
 
 
+backend = usage.get('backend_derived')
+fallback_endpoint = usage.get('endpoint') == 'fallback'
+
+
+def percent_with_source(key):
+    # Values that did not come straight from the primary usage endpoint
+    # (session-snapshot backfill or the fallback endpoint) are approximate:
+    # session rollouts carry no account identity and the fallback endpoint may
+    # use a different limit bucket. Prefix them with '~' so they can't be
+    # mistaken for live numbers.
+    value = derived.get(key)
+    approx = value is not None and isinstance(backend, dict) and backend.get(key) is None
+    if value is None:
+        value = session.get(key)
+        approx = value is not None
+    text = format_percent(value)
+    if text and (approx or fallback_endpoint):
+        text = '~' + text
+    return text
+
+
 payload = {
     'active': is_active,
     'profile': profile_name,
     'email': meta.get('email') or '',
     'account': meta.get('accountId') or '',
     'plan': first_value(usage.get('plan_type'), session.get('plan_type')) or '',
-    'five_hour': format_percent(first_value(derived.get('five_hour_remaining_percent'), session.get('five_hour_remaining_percent'))),
+    'five_hour': percent_with_source('five_hour_remaining_percent'),
     'five_hour_reset': format_datetime(first_value(derived.get('five_hour_reset_at'), session.get('five_hour_reset_at'))),
-    'weekly': format_percent(first_value(derived.get('weekly_remaining_percent'), session.get('weekly_remaining_percent'))),
+    'weekly': percent_with_source('weekly_remaining_percent'),
     'weekly_reset': format_datetime(first_value(derived.get('weekly_reset_at'), session.get('weekly_reset_at'))),
     'checked': format_datetime(usage.get('fetchedAt')),
     'token_expires': format_datetime(meta.get('tokenExpiresAt')),
@@ -765,8 +866,12 @@ refresh_usage_for_profile() {
     if [[ -f "$CURRENT_PROFILE_FILE" ]]; then
       current_name=$(cat "$CURRENT_PROFILE_FILE")
     fi
-    if [[ -n "$current_name" && "$current_name" == "$profile_name" && -f "$AUTH_FILE" ]]; then
-      # The snapshot may be stale — retry with the live session token
+    if [[ -n "$current_name" && "$current_name" == "$profile_name" && -f "$AUTH_FILE" ]] \
+      && live_auth_matches_profile "$AUTH_FILE" "$(profile_meta_path "$profile_name")"; then
+      # The snapshot may be stale — retry with the live session token.
+      # The identity guard above keeps a live auth.json that belongs to a
+      # different account (manual codex login) from being queried as this
+      # profile or synced over its snapshot.
       local live_error_file live_output live_status
       live_error_file=$(mktemp)
       if refresh_usage_python "$AUTH_FILE" "$usage_path" "$include_session" "$session_json" "$profile_name" >/dev/null 2>"$live_error_file"; then
@@ -1870,41 +1975,10 @@ switch_profile() {
       local outgoing_auth_path outgoing_meta_path
       outgoing_auth_path=$(profile_auth_path "$current_name")
       outgoing_meta_path=$(profile_meta_path "$current_name")
-      # Guard: verify the live auth.json belongs to the same account as the
-      # outgoing profile before overwriting its snapshot.  If identity cannot
-      # be confirmed (missing meta, missing fields, mismatch), skip silently.
-      local _do_presave=1
-      if [[ -f "$outgoing_meta_path" ]]; then
-        local _live_account_id _meta_account_id _live_email _meta_email
-        _live_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('tokens',{}).get('account_id',''))" "$AUTH_FILE" 2>/dev/null || true)
-        _meta_account_id=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('accountId',''))" "$outgoing_meta_path" 2>/dev/null || true)
-        if [[ -n "$_live_account_id" && -n "$_meta_account_id" ]]; then
-          [[ "$_live_account_id" == "$_meta_account_id" ]] || _do_presave=0
-        else
-          # Fall back to email comparison
-          _live_email=$(python3 -c "
-import base64,json,sys
-t=json.load(open(sys.argv[1])).get('tokens',{}).get('id_token','')
-parts=t.split('.') if isinstance(t,str) and '.' in t else []
-if len(parts)>=2:
-    p=parts[1]+'='*(-len(parts[1])%4)
-    try: print(json.loads(base64.urlsafe_b64decode(p)).get('email',''))
-    except: print('')
-else: print('')
-" "$AUTH_FILE" 2>/dev/null || true)
-          _meta_email=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('email',''))" "$outgoing_meta_path" 2>/dev/null || true)
-          if [[ -n "$_live_email" && -n "$_meta_email" ]]; then
-            [[ "$_live_email" == "$_meta_email" ]] || _do_presave=0
-          else
-            # Cannot verify identity — skip pre-save to be safe
-            _do_presave=0
-          fi
-        fi
-      else
-        # No meta.json for the outgoing profile — skip pre-save to be safe
-        _do_presave=0
-      fi
-      if [[ "$_do_presave" == "1" ]]; then
+      # Only overwrite the outgoing snapshot when the live auth.json
+      # verifiably belongs to that profile's account; skip silently otherwise
+      # (e.g. after a manual codex login to a different account).
+      if live_auth_matches_profile "$AUTH_FILE" "$outgoing_meta_path"; then
         cp "$AUTH_FILE" "$outgoing_auth_path"
         write_meta_file "$current_name" "$outgoing_auth_path" "$outgoing_meta_path"
       fi
@@ -1961,52 +2035,15 @@ remove_profile() {
   note "Removed '$profile_name'"
 }
 
-refresh_cancel_instruction() {
-  note "Use 'codex-auth refresh-usage <profile>' for one profile or 'codex-auth refresh-usage --all' to skip the prompt."
-}
-
-confirm_refresh_all_profiles() {
-  local reply
-  local read_status=0
-  printf 'Do you want to refresh usage for all profiles? [Y/n] ' >&2
-  read -r reply || read_status=$?
-  if [[ $read_status -ne 0 ]]; then
-    [[ $read_status -eq 130 ]] && return 130
-    note "Refresh cancelled."
-    refresh_cancel_instruction
-    return 1
-  fi
-  case "$reply" in
-    ""|y|Y|yes|YES|Yes)
-      return 0
-      ;;
-    n|N|no|NO|No)
-      note "Refresh cancelled."
-      refresh_cancel_instruction
-      return 1
-      ;;
-    *)
-      note "Refresh cancelled."
-      refresh_cancel_instruction
-      return 1
-      ;;
-  esac
-}
-
 refresh_usage_command() {
   ensure_dirs
   local target=${1:-}
   local use_utc=${2:-0}
   local include_stats=${3:-0}
-  local confirm_status=0
   local name error
   local index=0 total=0 failure_count=0
   local -a targets=()
-  if [[ -z "$target" ]]; then
-    confirm_refresh_all_profiles || confirm_status=$?
-    [[ $confirm_status -eq 0 ]] || return "$confirm_status"
-    target="--all"
-  fi
+  [[ -n "$target" ]] || target="--all"
 
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
