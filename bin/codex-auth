@@ -283,7 +283,11 @@ try:
     meta = json.loads(Path(meta_path).read_text())
 except Exception:
     raise SystemExit(1)
-tokens = auth.get('tokens') or {}
+if not isinstance(auth, dict) or not isinstance(meta, dict):
+    raise SystemExit(1)
+tokens = auth.get('tokens')
+if not isinstance(tokens, dict):
+    raise SystemExit(1)
 
 live_account = tokens.get('account_id') or ''
 meta_account = meta.get('accountId') or ''
@@ -299,9 +303,10 @@ def jwt_claims(token):
         return {}
     payload = parts[1] + '=' * (-len(parts[1]) % 4)
     try:
-        return json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+        decoded = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
     except Exception:
         return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 live_email = jwt_claims(tokens.get('id_token')).get('email') or jwt_claims(tokens.get('access_token')).get('email') or ''
@@ -674,7 +679,11 @@ def format_percent(value):
 
 
 backend = usage.get('backend_derived')
-fallback_endpoint = usage.get('endpoint') == 'fallback'
+# Legacy usage.json files predate the 'endpoint' field; infer fallback
+# fetches from the recorded URL until the next refresh rewrites the file.
+fallback_endpoint = usage.get('endpoint') == 'fallback' or (
+    'endpoint' not in usage and str(usage.get('url') or '').endswith('/wham/usage')
+)
 
 
 def percent_with_source(key):

@@ -1113,6 +1113,50 @@ test_refresh_marks_session_backfilled_percents_as_approximate() {
   trap - RETURN
 }
 
+test_list_marks_fallback_endpoint_usage_as_approximate() {
+  local home_dir output
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cat > "$home_dir/accounts/profiles/alpha/usage.json" <<'JSON'
+{
+  "fetchedAt":"2026-03-27T23:10:00Z",
+  "plan_type":"plus",
+  "endpoint":"fallback",
+  "backend_derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  },
+  "derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  }
+}
+JSON
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "~84%"
+  assert_contains "$output" "~61%"
+
+  # Legacy usage.json without the endpoint field: infer fallback from the URL.
+  cat > "$home_dir/accounts/profiles/alpha/usage.json" <<'JSON'
+{
+  "fetchedAt":"2026-03-27T23:10:00Z",
+  "plan_type":"plus",
+  "url":"https://chatgpt.com/backend-api/wham/usage",
+  "backend_derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  },
+  "derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  }
+}
+JSON
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "~84%"
+  assert_contains "$output" "~61%"
+}
+
 test_refresh_ignores_stale_session_snapshots() {
   local home_dir port_file server_pid output usage_url
   home_dir=$(mktemp -d)
@@ -1458,6 +1502,7 @@ main() {
   test_refresh_live_fallback_syncs_snapshot_when_live_account_matches
   test_refresh_live_fallback_requires_matching_live_account
   test_refresh_marks_session_backfilled_percents_as_approximate
+  test_list_marks_fallback_endpoint_usage_as_approximate
   test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta
