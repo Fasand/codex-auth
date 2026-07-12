@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.10.0"
+APP_VERSION="0.10.1"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -3527,18 +3527,41 @@ update_self() {
     installer_args+=(--skip-completions)
   fi
 
+  # Resolve the published version first so the update can report old → new
+  # and no-op when there is nothing to do. An unreadable remote version falls
+  # back to the old unconditional reinstall.
+  local remote_version=""
+  remote_version=$(curl -fsSL --connect-timeout 2 --max-time 4 "$from_base/VERSION" 2>/dev/null | head -n 1 | tr -d '[:space:]') || remote_version=""
+  [[ "$remote_version" =~ ^[0-9]+(\.[0-9]+)*$ ]] || remote_version=""
+  if [[ -n "$remote_version" ]] && ! is_newer_version "$APP_VERSION" "$remote_version"; then
+    if [[ "$remote_version" == "$APP_VERSION" ]]; then
+      note "codex-auth $(style_text CODEX_AUTH_THEME_PERCENT_OK_STYLE "$APP_VERSION") is already up to date."
+    else
+      note "Installed codex-auth $(style_text CODEX_AUTH_THEME_PERCENT_OK_STYLE "$APP_VERSION") is ahead of published $(style_text CODEX_AUTH_THEME_DIM_STYLE "$remote_version") — nothing to update."
+    fi
+    return 0
+  fi
+
   installer_path=$(mktemp "${TMPDIR:-/tmp}/codex-auth-install.XXXXXX") || die "Failed to allocate a temporary installer path"
   if ! curl -fsSL "$installer_url" -o "$installer_path"; then
     rm -f "$installer_path"
     die "Failed to download installer from $installer_url"
   fi
 
-  note "Updating codex-auth from $from_base"
-  if bash "$installer_path" "${installer_args[@]}"; then
-    rm -f "$installer_path"
+  local update_log status=0
+  update_log=$(mktemp)
+  if bash "$installer_path" "${installer_args[@]}" >"$update_log" 2>&1; then
+    rm -f "$installer_path" "$update_log"
+    if [[ -n "$remote_version" ]]; then
+      note "Updated codex-auth $(style_text CODEX_AUTH_THEME_DIM_STYLE "$APP_VERSION") → $(style_text CODEX_AUTH_THEME_PERCENT_OK_STYLE "$remote_version")"
+    else
+      note "Updated codex-auth from $(style_text CODEX_AUTH_THEME_DIM_STYLE "$from_base")"
+    fi
   else
-    local status=$?
-    rm -f "$installer_path"
+    status=$?
+    cat "$update_log" >&2
+    rm -f "$installer_path" "$update_log"
+    note "codex-auth update failed (installer output above)"
     return "$status"
   fi
 }
@@ -3614,13 +3637,15 @@ maybe_check_for_update() {
   [[ -n "$remote_version" ]] || return 0
   is_newer_version "$APP_VERSION" "$remote_version" || return 0
 
-  printf 'codex-auth %s is available (current %s). Update now? [Y/n] ' "$remote_version" "$APP_VERSION" >&2
+  printf 'codex-auth %s is available (current %s). Update now? [Y/n] ' \
+    "$(style_text CODEX_AUTH_THEME_PERCENT_OK_STYLE "$remote_version")" \
+    "$(style_text CODEX_AUTH_THEME_DIM_STYLE "$APP_VERSION")" >&2
   reply=""
   read -r reply || reply="n"
   case "$reply" in
     ""|y|Y|yes|YES|Yes)
       if update_self; then
-        note "Updated to codex-auth $remote_version. Re-run your command."
+        note "Re-run your command."
         exit 0
       fi
       note "Update failed — continuing with the current version."
