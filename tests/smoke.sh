@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.10.0"
+EXPECTED_VERSION="0.10.1"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -919,13 +919,40 @@ test_re_running_the_installer_updates_in_place() {
   [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after reinstall"
 }
 
+make_remote_release_fixture() {
+  local version=$1
+  local remote_dir
+  remote_dir=$(mktemp -d)
+  mkdir -p "$remote_dir/bin" "$remote_dir/completions"
+  sed "s/^APP_VERSION=.*/APP_VERSION=\"$version\"/" "$ROOT_DIR/bin/codex-auth" > "$remote_dir/bin/codex-auth"
+  cp "$ROOT_DIR/install.sh" "$remote_dir/install.sh"
+  cp "$ROOT_DIR/completions/codex-auth.bash" "$remote_dir/completions/codex-auth.bash"
+  printf '%s\n' "$version" > "$remote_dir/VERSION"
+  printf '%s\n' "$remote_dir"
+}
+
 test_update_command_reuses_the_installer_without_cloning() {
-  local prefix stub_codex_dir
+  local prefix stub_codex_dir remote_dir output
+  prefix=$(mktemp -d)
+  stub_codex_dir=$(make_stub_codex_dir)
+  remote_dir=$(make_remote_release_fixture "9.9.9")
+  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
+  output=$(PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" "$prefix/bin/codex-auth" update 2>&1)
+  assert_contains "$output" "Updated codex-auth $EXPECTED_VERSION → 9.9.9"
+  assert_not_contains "$output" "Installing codex-auth"
+  [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
+  [[ "$("$prefix/bin/codex-auth" --version)" == "9.9.9" ]] || fail "expected updated binary to report 9.9.9"
+}
+
+test_update_command_reports_already_up_to_date() {
+  local prefix stub_codex_dir output
   prefix=$(mktemp -d)
   stub_codex_dir=$(make_stub_codex_dir)
   PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
-  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" "$prefix/bin/codex-auth" update >/dev/null
-  [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
+  output=$(PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" "$prefix/bin/codex-auth" update 2>&1)
+  assert_contains "$output" "codex-auth $EXPECTED_VERSION is already up to date."
+  assert_not_contains "$output" "Updated codex-auth"
+  [[ "$("$prefix/bin/codex-auth" --version)" == "$EXPECTED_VERSION" ]] || fail "expected binary version to stay $EXPECTED_VERSION"
 }
 
 test_update_check_prompts_once_and_declining_runs_command() {
@@ -975,18 +1002,14 @@ test_update_check_accepting_updates_and_skips_the_command() {
   local prefix stub_codex_dir remote_dir home_dir output
   prefix=$(mktemp -d)
   home_dir=$(mktemp -d)
-  remote_dir=$(mktemp -d)
   stub_codex_dir=$(make_stub_codex_dir)
-  mkdir -p "$remote_dir/bin" "$remote_dir/completions"
-  sed 's/^APP_VERSION=.*/APP_VERSION="9.9.9"/' "$ROOT_DIR/bin/codex-auth" > "$remote_dir/bin/codex-auth"
-  cp "$ROOT_DIR/install.sh" "$remote_dir/install.sh"
-  cp "$ROOT_DIR/completions/codex-auth.bash" "$remote_dir/completions/codex-auth.bash"
-  printf '9.9.9\n' > "$remote_dir/VERSION"
+  remote_dir=$(make_remote_release_fixture "9.9.9")
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
   PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
 
   output=$(printf '\n' | PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" "$prefix/bin/codex-auth" list 2>&1)
   assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "Updated codex-auth $EXPECTED_VERSION → 9.9.9"
   assert_contains "$output" "Re-run your command"
   assert_not_contains "$output" "PROFILE"
   [[ "$("$prefix/bin/codex-auth" --version)" == "9.9.9" ]] || fail "expected updated binary to report 9.9.9, got: $("$prefix/bin/codex-auth" --version)"
@@ -1562,6 +1585,7 @@ main() {
   test_remote_style_install_works_without_from_flag
   test_re_running_the_installer_updates_in_place
   test_update_command_reuses_the_installer_without_cloning
+  test_update_command_reports_already_up_to_date
   test_update_check_prompts_once_and_declining_runs_command
   test_update_check_failures_never_block_the_command
   test_update_check_skipped_when_not_interactive

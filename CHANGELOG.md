@@ -2,6 +2,12 @@
 
 Newest releases go at the top.
 
+## 0.10.1 - 2026-07-12
+
+- Made `codex-auth update` report the version transition (`0.10.0 → 0.10.1`) with the same terminal colors as the rest of the CLI, and hide the installer output unless it fails.
+- Made `codex-auth update` say "already up to date" (and skip the reinstall) when the published version is not newer than the installed one.
+- Colored the daily update-check prompt versions to match.
+
 ## 0.10.0 - 2026-07-12
 
 - Added a daily automatic update check for installed copies: the first interactive command of the day compares against the published `VERSION` and offers `Update now? [Y/n]`; accepting updates in place and skips the original command. Non-interactive runs, cron jobs, local checkouts, and any network failure silently skip the check (`CODEX_AUTH_NO_UPDATE_CHECK=1` opts out).
