@@ -2,7 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.9.0"
+EXPECTED_VERSION="0.10.0"
+
+# Keep the daily update check inert for every test; update-check tests
+# re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
+export CODEX_AUTH_NO_UPDATE_CHECK=1
 
 fail() {
   echo "FAIL: $*" >&2
@@ -252,6 +256,21 @@ write_rollout_fixture() {
   } > "$home_dir/sessions/$relative_dir/$rollout_name.jsonl"
 }
 
+write_session_rate_limit_rollout_fixture() {
+  local home_dir=$1
+  local relative_dir=$2
+  local rollout_name=$3
+  local timestamp=$4
+  local primary_used=$5
+  local secondary_used=$6
+  mkdir -p "$home_dir/sessions/$relative_dir"
+  {
+    printf '{"timestamp":"%s","type":"session_meta","payload":{"id":"%s"}}\n' "$timestamp" "$rollout_name"
+    printf '{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":0,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":1100},"model_context_window":272000},"rate_limits":{"primary":{"used_percent":%s,"resets_at":1774656360},"secondary":{"used_percent":%s,"resets_at":1774829160},"plan_type":"plus"}}}\n' \
+      "$timestamp" "$primary_used" "$secondary_used"
+  } > "$home_dir/sessions/$relative_dir/$rollout_name.jsonl"
+}
+
 write_pricing_fixture() {
   local path=$1
   cat > "$path" <<'HTML'
@@ -279,7 +298,8 @@ HTML
 start_mock_usage_server() {
   local port_file=$1
   local fail_tokens=${2:-}
-  python3 -u - "$port_file" "$fail_tokens" >/dev/null 2>&1 <<'PY' &
+  local bare_tokens=${3:-}
+  python3 -u - "$port_file" "$fail_tokens" "$bare_tokens" >/dev/null 2>&1 <<'PY' &
 import http.server
 import json
 import socketserver
@@ -287,11 +307,20 @@ import sys
 
 port_file = sys.argv[1]
 fail_tokens = {token for token in sys.argv[2].split(',') if token}
+bare_tokens = {token for token in sys.argv[3].split(',') if token}
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         auth = self.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
+        if token in bare_tokens:
+            payload = json.dumps({"plan_type": "plus"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if token in fail_tokens:
             body = {
                 "status": 401,
@@ -450,7 +479,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-06-04"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-07-12"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
@@ -540,7 +569,9 @@ test_token_status_reports_both_token_expirations() {
 test_token_status_uses_color_and_active_marker_when_enabled() {
   local home_dir output
   home_dir=$(mktemp -d)
-  create_profile_fixture_with_jwts "$home_dir" "alpha" "alpha@example.com" "acct_alpha" 1780572521 1781432921
+  # Far-future expiries (2100-01-01): this test asserts live "valid" status,
+  # so near-term epochs would turn into a time bomb as real time passes.
+  create_profile_fixture_with_jwts "$home_dir" "alpha" "alpha@example.com" "acct_alpha" 4102444800 4102448400
   create_profile_fixture_with_jwts "$home_dir" "beta" "beta@example.com" "acct_beta" 1770000100 1770000200
   cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
   printf 'alpha\n' > "$home_dir/accounts/current_profile"
@@ -897,6 +928,70 @@ test_update_command_reuses_the_installer_without_cloning() {
   [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
 }
 
+test_update_check_prompts_once_and_declining_runs_command() {
+  local home_dir remote_dir output
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list 2>&1)
+  assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "PROFILE"
+  [[ -f "$home_dir/accounts/update-check" ]] || fail "expected update-check cache to be written"
+
+  # Within the TTL window the check is skipped entirely.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list < /dev/null 2>&1)
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+}
+
+test_update_check_failures_never_block_the_command() {
+  local home_dir output status=0
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file:///nonexistent-codex-auth-remote" /bin/bash "$ROOT_DIR/bin/codex-auth" list < /dev/null 2>&1) || status=$?
+  [[ $status -eq 0 ]] || fail "expected list to succeed when the update check cannot reach the remote"
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+  [[ -f "$home_dir/accounts/update-check" ]] || fail "expected failed check attempt to be cached to avoid retry storms"
+}
+
+test_update_check_skipped_when_not_interactive() {
+  local home_dir remote_dir output
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+
+  output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list 2>&1)
+  assert_not_contains "$output" "is available"
+  assert_contains "$output" "PROFILE"
+  [[ ! -f "$home_dir/accounts/update-check" ]] || fail "expected no update-check cache for non-interactive runs"
+}
+
+test_update_check_accepting_updates_and_skips_the_command() {
+  local prefix stub_codex_dir remote_dir home_dir output
+  prefix=$(mktemp -d)
+  home_dir=$(mktemp -d)
+  remote_dir=$(mktemp -d)
+  stub_codex_dir=$(make_stub_codex_dir)
+  mkdir -p "$remote_dir/bin" "$remote_dir/completions"
+  sed 's/^APP_VERSION=.*/APP_VERSION="9.9.9"/' "$ROOT_DIR/bin/codex-auth" > "$remote_dir/bin/codex-auth"
+  cp "$ROOT_DIR/install.sh" "$remote_dir/install.sh"
+  cp "$ROOT_DIR/completions/codex-auth.bash" "$remote_dir/completions/codex-auth.bash"
+  printf '9.9.9\n' > "$remote_dir/VERSION"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
+  PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
+
+  output=$(printf '\n' | PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" "$prefix/bin/codex-auth" list 2>&1)
+  assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "Re-run your command"
+  assert_not_contains "$output" "PROFILE"
+  [[ "$("$prefix/bin/codex-auth" --version)" == "9.9.9" ]] || fail "expected updated binary to report 9.9.9, got: $("$prefix/bin/codex-auth" --version)"
+}
+
 test_list_works_with_minimal_path() {
   local home_dir stub_dir output
   home_dir=$(mktemp -d)
@@ -982,7 +1077,7 @@ test_list_shows_refresh_issue_heading_when_all_profiles_have_errors() {
   assert_contains "$output" "↳ issue: token_expired: token expired for token_beta"
 }
 
-test_refresh_without_args_prompts_and_lists_all_profiles() {
+test_refresh_without_args_refreshes_all_profiles_without_prompting() {
   local home_dir port_file server_pid output usage_url
   home_dir=$(mktemp -d)
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
@@ -995,8 +1090,8 @@ test_refresh_without_args_prompts_and_lists_all_profiles() {
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
-  output=$(printf '\n' | TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-usage 2>&1)
-  assert_contains "$output" "Do you want to refresh usage for all profiles?"
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-usage < /dev/null 2>&1)
+  assert_not_contains "$output" "Do you want to refresh usage for all profiles?"
   assert_contains "$output" "Refreshing 1/2: alpha..."
   assert_contains "$output" "Refreshing 2/2: beta..."
   assert_contains "$output" "Refreshed alpha"
@@ -1014,15 +1109,143 @@ test_refresh_without_args_prompts_and_lists_all_profiles() {
   trap - RETURN
 }
 
-test_refresh_cancel_shows_usage_instruction() {
+test_refresh_live_fallback_syncs_snapshot_when_live_account_matches() {
+  local home_dir port_file server_pid output usage_url
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  printf 'beta\n' > "$home_dir/accounts/current_profile"
+  cat > "$home_dir/auth.json" <<'JSON'
+{"tokens":{"access_token":"token_live_beta","account_id":"acct_beta"}}
+JSON
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file" "token_beta")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh beta 2>&1)
+  assert_contains "$output" "snapshot was stale — auto-synced from live Codex session"
+  assert_contains "$output" "Refreshed beta"
+  assert_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "token_live_beta"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
+test_refresh_live_fallback_requires_matching_live_account() {
+  local home_dir port_file server_pid output usage_url status=0
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  printf 'beta\n' > "$home_dir/accounts/current_profile"
+  cat > "$home_dir/auth.json" <<'JSON'
+{"tokens":{"access_token":"token_live_other","account_id":"acct_other"}}
+JSON
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file" "token_beta")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh beta 2>&1) || status=$?
+  [[ $status -ne 0 ]] || fail "expected refresh to fail when live auth belongs to another account"
+  assert_contains "$output" "token_expired"
+  assert_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "token_beta"
+  assert_not_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "token_live_other"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
+test_refresh_marks_session_backfilled_percents_as_approximate() {
+  local home_dir port_file server_pid output usage_url now_iso
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_bare_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  write_session_rate_limit_rollout_fixture "$home_dir" "2026/07/12" "rollout-live" "$now_iso" 16 39
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file" "" "token_bare_alpha")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh alpha 2>&1)
+  assert_contains "$output" "Refreshed alpha"
+  assert_contains "$output" "~84%"
+  assert_contains "$output" "~61%"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
+test_list_marks_fallback_endpoint_usage_as_approximate() {
   local home_dir output
   home_dir=$(mktemp -d)
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
-  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  cat > "$home_dir/accounts/profiles/alpha/usage.json" <<'JSON'
+{
+  "fetchedAt":"2026-03-27T23:10:00Z",
+  "plan_type":"plus",
+  "endpoint":"fallback",
+  "backend_derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  },
+  "derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  }
+}
+JSON
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "~84%"
+  assert_contains "$output" "~61%"
 
-  output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh 2>&1 || true)
-  assert_contains "$output" "Do you want to refresh usage for all profiles?"
-  assert_contains "$output" "Use 'codex-auth refresh-usage <profile>' for one profile"
+  # Legacy usage.json without the endpoint field: infer fallback from the URL.
+  cat > "$home_dir/accounts/profiles/alpha/usage.json" <<'JSON'
+{
+  "fetchedAt":"2026-03-27T23:10:00Z",
+  "plan_type":"plus",
+  "url":"https://chatgpt.com/backend-api/wham/usage",
+  "backend_derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  },
+  "derived":{
+    "five_hour_remaining_percent":84,
+    "weekly_remaining_percent":61
+  }
+}
+JSON
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list)
+  assert_contains "$output" "~84%"
+  assert_contains "$output" "~61%"
+}
+
+test_refresh_ignores_stale_session_snapshots() {
+  local home_dir port_file server_pid output usage_url
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_bare_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  write_session_rate_limit_rollout_fixture "$home_dir" "2026/07/10" "rollout-old" "2026-07-10T10:00:00Z" 16 39
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file" "" "token_bare_alpha")
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
+
+  output=$(TZ=Europe/Prague NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$usage_url" CODEX_AUTH_NOW="2026-07-12T12:00:00Z" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh alpha 2>&1)
+  assert_contains "$output" "Refreshed alpha"
+  assert_not_contains "$output" "84%"
+  assert_not_contains "$output" "61%"
+  assert_not_contains "$output" "~"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
 }
 
 test_refresh_continues_after_profile_failures_and_summarizes() {
@@ -1339,12 +1562,20 @@ main() {
   test_remote_style_install_works_without_from_flag
   test_re_running_the_installer_updates_in_place
   test_update_command_reuses_the_installer_without_cloning
+  test_update_check_prompts_once_and_declining_runs_command
+  test_update_check_failures_never_block_the_command
+  test_update_check_skipped_when_not_interactive
+  test_update_check_accepting_updates_and_skips_the_command
   test_list_works_with_minimal_path
   test_list_uses_local_timezone_by_default_and_utc_when_requested
   test_list_groups_profiles_with_refresh_errors_at_the_end
   test_list_shows_refresh_issue_heading_when_all_profiles_have_errors
-  test_refresh_without_args_prompts_and_lists_all_profiles
-  test_refresh_cancel_shows_usage_instruction
+  test_refresh_without_args_refreshes_all_profiles_without_prompting
+  test_refresh_live_fallback_syncs_snapshot_when_live_account_matches
+  test_refresh_live_fallback_requires_matching_live_account
+  test_refresh_marks_session_backfilled_percents_as_approximate
+  test_list_marks_fallback_endpoint_usage_as_approximate
+  test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta
   test_token_status_reports_both_token_expirations

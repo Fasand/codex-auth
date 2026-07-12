@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.9.0`
+Current version: `0.10.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -112,6 +112,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/main/insta
 
 Existing installations continue to update in place; you do not need to remove anything first.
 
+### Automatic update check
+
+Installed copies check for a new version at most once per day: the first interactive command of the day fetches the tiny `VERSION` file from the raw GitHub base (2s connect / 4s total budget) and, if a newer release exists, asks `Update now? [Y/n]`. Pressing Enter updates immediately and skips the command you were running — re-run it afterwards. Declining continues normally and stays quiet until the next day's check.
+
+The check never runs for scripts, pipes, or cron jobs (interactive terminals only), never in a local git checkout, and any failure — offline, timeout, missing `curl` — silently skips the check without affecting your command. Failed attempts are cached too, so an offline machine pays the timeout at most once per day.
+
+- `CODEX_AUTH_NO_UPDATE_CHECK=1` disables the check entirely.
+- `CODEX_AUTH_UPDATE_CHECK_TTL_SECONDS` overrides the once-per-day interval (default `86400`).
+
 ## Install a specific tagged version
 
 The repository keeps retained release tags so you can install specific historical versions when needed. Use the same raw GitHub pattern, but replace `main` with a tag such as `0.3.0`:
@@ -185,7 +194,8 @@ Run `codex-auth help` for the full command reference.
 ### Refresh behavior
 
 - `codex-auth refresh-usage` and `codex-auth refresh` refresh **usage data** from ChatGPT Codex usage endpoints. They do not perform a Codex OAuth token refresh by themselves.
-- `codex-auth refresh-usage` or `codex-auth refresh` with no profile name asks for confirmation before refreshing every saved profile.
+- `codex-auth refresh-usage` or `codex-auth refresh` with no profile name refreshes every saved profile directly, same as `--all`.
+- Percentages prefixed with `~` are approximate: they were backfilled from the latest local Codex session snapshot (recent rollouts only) or fetched from the fallback usage endpoint, rather than coming straight from the primary usage endpoint.
 - Multi-profile refreshes show progress as each profile is processed; interactive terminals use a single live-updating line, while non-interactive output stays line-based.
 - If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
 - Refresh prints the updated profile list quickly by default. Pass `--with-stats` if you also want the slower local-session usage footer after the refresh.
