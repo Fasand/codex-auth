@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.10.1"
+EXPECTED_VERSION="0.10.2"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -479,7 +479,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-07-12"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-07-18"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
 }
 
@@ -540,6 +540,83 @@ assert meta["hasRefreshToken"] is True
 PY
   kill "$server_pid" 2>/dev/null || true
   trap - RETURN
+}
+
+test_switch_round_trip_preserves_the_saved_snapshot_byte_for_byte() {
+  # DEV-259: rule out the "wrong slot / corrupted persistence" hypothesis.
+  # save A -> switch to B -> switch back to A must restore A's exact tokens,
+  # including the refresh token ("the tokens don't live through").
+  local home_dir codex_dir output
+  home_dir=$(mktemp -d)
+  codex_dir=$(make_stub_codex_dir)
+  mkdir -p "$home_dir"
+  local id_token access_token
+  id_token=$(make_jwt "alpha@example.com" "sub_alpha" 1790000000 1770000000 "app_EMoamEEZ73f0CkXaXp7hrann")
+  access_token=$(make_jwt "alpha@example.com" "sub_alpha" 1790000000 1770000000 "https://api.openai.com/v1")
+  cat > "$home_dir/auth.json" <<JSON
+{"auth_mode":"chatgpt","last_refresh":"2026-06-04T10:28:41Z","tokens":{"access_token":"$access_token","id_token":"$id_token","refresh_token":"refresh_alpha_R1","account_id":"acct_alpha"}}
+JSON
+
+  PATH="$codex_dir:$PATH" CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" save alpha >/dev/null 2>&1
+  # A pristine copy of what account A looked like when it was saved.
+  local saved_alpha
+  saved_alpha=$(mktemp)
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$saved_alpha"
+
+  # A second, distinct account to switch to and back from.
+  create_profile_fixture_with_jwts "$home_dir" "beta" "beta@example.com" "acct_beta" 1790000000 1790000000
+
+  PATH="$codex_dir:$PATH" CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" switch beta >/dev/null 2>&1
+  PATH="$codex_dir:$PATH" CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" switch alpha >/dev/null 2>&1
+
+  cmp -s "$saved_alpha" "$home_dir/auth.json" \
+    || fail "switch away and back must restore account alpha's snapshot byte-for-byte"
+  python3 - "$home_dir/auth.json" <<'PY' || fail "restored live auth.json must carry alpha's original refresh token"
+import json, sys
+tokens = json.load(open(sys.argv[1]))["tokens"]
+assert tokens["refresh_token"] == "refresh_alpha_R1", tokens.get("refresh_token")
+assert tokens["account_id"] == "acct_alpha", tokens.get("account_id")
+PY
+  rm -f "$saved_alpha"
+}
+
+test_switch_warns_when_restored_snapshot_token_is_expired() {
+  # DEV-259: when the restored snapshot is already expired, Codex is forced onto
+  # the refresh token on first use; if that token was rotated upstream the switch
+  # silently hands over a dead session. The switch must say so instead.
+  local home_dir now output
+  home_dir=$(mktemp -d)
+  now="2026-06-01T00:00:00Z"   # epoch 1780272000
+  # Stale: access token expired well before "now".
+  create_profile_fixture_with_jwts "$home_dir" "stale" "stale@example.com" "acct_stale" 1770000000 1779000000
+  # Healthy: both tokens valid past "now".
+  create_profile_fixture_with_jwts "$home_dir" "fresh" "fresh@example.com" "acct_fresh" 1790000000 1790000000
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" switch stale 2>&1)
+  assert_contains "$output" "Restored snapshot for 'stale' access token expired"
+  assert_contains "$output" "codex-auth touch stale"
+
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" switch fresh 2>&1)
+  assert_not_contains "$output" "Restored snapshot for 'fresh'"
+
+  # Switch away first so the live auth no longer matches 'fresh' — otherwise the
+  # pre-switch save-back would re-copy the live (still refresh-token-bearing)
+  # auth over the snapshot we are about to hand-edit.
+  NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" switch stale >/dev/null 2>&1
+  # A snapshot missing its refresh token can never be revived by a refresh.
+  python3 - "$home_dir/accounts/profiles/fresh/auth.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+obj = json.load(open(p))
+obj["tokens"].pop("refresh_token", None)
+json.dump(obj, open(p, "w"))
+PY
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" switch fresh 2>&1)
+  assert_contains "$output" "Restored snapshot for 'fresh' has no refresh token"
 }
 
 test_token_status_reports_both_token_expirations() {
@@ -1602,6 +1679,8 @@ main() {
   test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta
+  test_switch_round_trip_preserves_the_saved_snapshot_byte_for_byte
+  test_switch_warns_when_restored_snapshot_token_is_expired
   test_token_status_reports_both_token_expirations
   test_token_status_uses_color_and_active_marker_when_enabled
   test_touch_profile_runs_minimal_codex_exec_saves_token_and_restores_current_profile

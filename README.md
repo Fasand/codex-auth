@@ -208,6 +208,19 @@ Run `codex-auth help` for the full command reference.
 - Codex does not necessarily rotate tokens on every touch. If the current access token is still acceptable to Codex, `touch` can complete successfully and report that tokens were unchanged.
 - Touching profiles consumes a small amount of Codex usage because it sends a real request.
 
+### Why a saved profile can go stale (refresh-token rotation)
+
+A saved profile is a point-in-time copy of Codex's `auth.json`. That file holds a short-lived access token **and** a refresh token, and OpenAI issues **one live refresh token per account**: every time Codex refreshes (or you run `codex login` again for that account, on this or another machine), a new refresh token is minted and the previous one is invalidated. A snapshot taken before that rotation still contains the old, now-dead refresh token.
+
+Because the access token stays valid for several days, a switch to a stale profile often *looks* fine at first and only fails later — the moment Codex needs to refresh, it presents the dead refresh token, the refresh is rejected, and Codex asks you to log in again. This is the root cause behind "switching accounts doesn't hold" (DEV-259); it is upstream OpenAI behavior, not something `codex-auth` can paper over by restoring the saved bytes.
+
+What `codex-auth` does about it:
+
+- **`switch` tells you when the snapshot it just restored is already expired** (or has no refresh token). It cannot know offline whether the refresh token was rotated away, so instead of silently handing over a session that will fail on first use, it prints a warning pointing at `codex-auth touch`, re-login, and `codex-auth cron setup`.
+- **`codex-auth touch <profile>` is the reliable way to keep a profile switch-ready:** it re-mints the tokens through Codex and saves the fresh snapshot. Run it before relying on a profile you haven't used in a while.
+- **`codex-auth cron setup` automates the above** so every profile is refreshed on a schedule and stays switchable. If you rotate between accounts regularly, this is the intended workflow — a daily `touch --all` keeps every snapshot alive.
+- If a profile is genuinely revoked upstream (e.g. you logged that account in elsewhere), no restore can revive it — re-authenticate with `codex login && codex-auth save <profile>`.
+
 ### Scheduled touch cron jobs
 
 - The cron commands require a working user `crontab` command on the machine where you schedule the job.

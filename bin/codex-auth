@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.10.1"
+APP_VERSION="0.10.2"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -1965,6 +1965,90 @@ choose_profile_interactive() {
   printf '%s\n' "${options[choice-1]}"
 }
 
+# Warn (to stderr) when the snapshot just restored onto the live auth.json is
+# already expired. This is the moment Codex is forced onto the refresh token,
+# and if that refresh token was rotated by a newer login/session (OpenAI issues
+# one live refresh token per account and invalidates the previous one on each
+# refresh), the refresh fails and Codex demands an immediate re-login. codex-auth
+# cannot tell offline whether the refresh token is still alive, so instead of
+# silently handing over a snapshot that will fail on first use, it says so and
+# points at the ways to verify/repair. See DEV-259. Set CODEX_AUTH_NOW to pin
+# "now" in tests (ISO-8601 or epoch seconds).
+warn_if_restored_token_stale() {
+  local profile_name=$1
+  local auth_path=$2
+  local reason
+  reason=$(python3 - "$auth_path" <<'PY'
+import base64
+import datetime as dt
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    obj = json.loads(Path(sys.argv[1]).read_text())
+except Exception:
+    raise SystemExit(0)
+tokens = obj.get('tokens') if isinstance(obj, dict) else None
+if not isinstance(tokens, dict):
+    raise SystemExit(0)
+
+
+def token_exp(token):
+    if not isinstance(token, str) or '.' not in token:
+        return None
+    parts = token.split('.')
+    if len(parts) < 2 or not parts[1]:
+        return None
+    payload = parts[1] + '=' * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return None
+    return claims.get('exp') if isinstance(claims, dict) else None
+
+
+def parse_now(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.isdigit():
+        return dt.datetime.fromtimestamp(int(text), tz=dt.timezone.utc)
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+now = parse_now(os.environ.get('CODEX_AUTH_NOW')) or dt.datetime.now(dt.timezone.utc)
+now_epoch = int(now.timestamp())
+
+# The access token is the ~multi-day credential Codex presents directly; once it
+# is expired Codex must refresh, which is exactly when a rotated refresh token
+# surfaces as a failure. A snapshot kept fresh (e.g. via `codex-auth touch`) has
+# a valid access token, so healthy switches stay quiet.
+access_exp = token_exp(tokens.get('access_token'))
+if not tokens.get('refresh_token'):
+    print('has no refresh token')
+elif access_exp is not None and access_exp <= now_epoch:
+    when = dt.datetime.fromtimestamp(access_exp, tz=dt.timezone.utc).strftime('%Y-%m-%d %H:%MZ')
+    print(f'access token expired {when}')
+PY
+)
+  [[ -n "$reason" ]] || return 0
+  note "⚠ Restored snapshot for '$profile_name' $reason."
+  note "  Codex will try to refresh on first use. If that refresh token was rotated by a newer login, the refresh fails and Codex will ask you to re-authenticate."
+  note "  Verify/repair now:  codex-auth touch $profile_name   (re-mints the token via Codex)"
+  note "  Or re-login:        codex login && codex-auth save $profile_name"
+  note "  Keep snapshots fresh automatically:  codex-auth cron setup"
+}
+
 switch_profile() {
   ensure_dirs
   local target=${1:-}
@@ -2002,6 +2086,7 @@ switch_profile() {
   write_current_profile_marker "$target"
   note "Switched to '$target'"
   render_profile_line "$target" "$target"
+  warn_if_restored_token_stale "$target" "$AUTH_FILE"
 }
 
 add_profile() {
