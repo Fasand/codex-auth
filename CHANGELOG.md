@@ -2,6 +2,11 @@
 
 Newest releases go at the top.
 
+## 0.10.2 - 2026-07-18
+
+- Made `codex-auth switch` warn (instead of silently proceeding) when the restored snapshot's access token is already expired or the snapshot has no refresh token — the moment Codex is forced onto the refresh token, which is when an upstream-rotated (dead) refresh token surfaces as an immediate re-login prompt. The warning points at `codex-auth touch`, re-login, and `codex-auth cron setup` to verify/repair or keep snapshots fresh (DEV-259).
+- Documented in the README that OpenAI issues one live refresh token per account and rotates it on every refresh/new login, so point-in-time snapshots go stale; `codex-auth touch`/`cron` are the way to keep switching reliable.
+
 ## 0.10.1 - 2026-07-12
 
 - Made `codex-auth update` report the version transition (`0.10.0 → 0.10.1`) with the same terminal colors as the rest of the CLI, and hide the installer output unless it fails.
