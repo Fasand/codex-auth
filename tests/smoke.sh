@@ -481,6 +481,7 @@ test_changelog_tracks_the_current_release_newest_first() {
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
   assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-07-18"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
+  assert_contains "$(cat "$ROOT_DIR/README.md")" "Current version: \`$EXPECTED_VERSION\`"
 }
 
 test_agents_md_captures_repo_workflow() {
