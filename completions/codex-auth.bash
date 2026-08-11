@@ -66,7 +66,11 @@ _codex_auth_completion() {
   fi
 
   case "$prev" in
-    save|switch|add|remove|rm|delete)
+    add)
+      COMPREPLY=( $(compgen -W "--device-auth $profiles" -- "$cur") )
+      return 0
+      ;;
+    save|switch|remove|rm|delete)
       COMPREPLY=( $(compgen -W "$profiles" -- "$cur") )
       return 0
       ;;

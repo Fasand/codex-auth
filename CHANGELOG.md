@@ -2,6 +2,11 @@
 
 Newest releases go at the top.
 
+## 0.11.1 - 2026-08-11
+
+- `codex-auth add <name> --device-auth` runs `codex login --device-auth` (device-code flow) for headless/remote machines where the browser + localhost callback flow fails — curling the printed localhost URL cannot complete the OAuth exchange.
+- When browser-based login fails, `add` now points at the `--device-auth` alternative.
+
 ## 0.11.0 - 2026-08-11
 
 - Added `codex-auth refresh-tokens [<name>|--all] [--force]`: rotates saved OAuth tokens directly via the same refresh grant the Codex CLI uses, without running a model request. By default it only rotates profiles whose access token has less than 5 days of life left (`CODEX_AUTH_REFRESH_TOKENS_MIN_VALID_SECONDS`), always operates on the live `auth.json` when it belongs to the target account (so a superseded snapshot refresh token is never replayed — replaying one gets the whole grant revoked server-side), and heals the snapshot from the live chain.
