@@ -2,6 +2,18 @@
 
 Newest releases go at the top.
 
+## 0.11.0 - 2026-08-11
+
+- Added `codex-auth refresh-tokens [<name>|--all] [--force]`: rotates saved OAuth tokens directly via the same refresh grant the Codex CLI uses, without running a model request. By default it only rotates profiles whose access token has less than 5 days of life left (`CODEX_AUTH_REFRESH_TOKENS_MIN_VALID_SECONDS`), always operates on the live `auth.json` when it belongs to the target account (so a superseded snapshot refresh token is never replayed — replaying one gets the whole grant revoked server-side), and heals the snapshot from the live chain.
+- Scheduled cron jobs now run `refresh-tokens` + `refresh-usage` instead of `touch`: token keep-alive no longer burns plan usage (daily `codex exec` touches were eating free-plan limits) and no longer swaps the live `auth.json` around under running Codex sessions.
+- `codex-auth add` now stashes the live `auth.json` away before running `codex login` (and restores it if login fails). `codex login`/`codex logout` revoke whatever tokens they find, which was the main way a previously working profile's refresh token got invalidated during account switches. Never run bare `codex logout` to switch accounts.
+- Rate-limit windows are no longer assumed to be 5h + weekly. The ChatGPT backend now reports a single plan-dependent window (e.g. 7 days on Plus, 30 days on free) via `limit_window_seconds`; `list`, `current`, the switch picker, and session snapshots now label each window from its actual duration (`weekly 97%`, `30d 0%`) under generic LIMIT columns.
+- Re-login guidance now points at `codex-auth add <profile>` instead of `codex logout && codex login` chains (`codex login` has also revoked existing auth before starting since Codex 0.140.0, so even bare re-logins kill the live account's profile).
+- Added a `RELEASE_NOTES` mechanism: updates and update prompts now show a short "What's new" message for every version newer than the installed one, so behavior changes reach users who never read the changelog.
+- Profile lines now show a `credits=` segment when the account has a usage-based credit balance (the usage payload's new `credits` block).
+- `touch` snapshot syncing now verifies the live `auth.json` belongs to the touched profile's account before overwriting the snapshot, so a concurrent Codex session writing its own tokens mid-touch can no longer cross-contaminate profiles (and a refused sync now fails the touch instead of reporting success).
+- Hardening from cross-model review: `add` restores the stashed auth on interrupt and keeps the stash until the new profile is saved; the refresh-tokens lock is cleaned up on interrupt; token files are written 0600 from creation; a refresh response without replacement tokens is rejected without touching the auth file; a concurrent rewrite of the auth file during rotation parks the new tokens in a `.rotated` sidecar instead of clobbering; rotation failures recorded in `usage.json` now survive later successful usage refreshes.
+
 ## 0.10.2 - 2026-07-18
 
 - Made `codex-auth switch` warn (instead of silently proceeding) when the restored snapshot's access token is already expired or the snapshot has no refresh token — the moment Codex is forced onto the refresh token, which is when an upstream-rotated (dead) refresh token surfaces as an immediate re-login prompt. The warning points at `codex-auth touch`, re-login, and `codex-auth cron setup` to verify/repair or keep snapshots fresh (DEV-259).

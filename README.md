@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.10.2`
+Current version: `0.11.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -18,9 +18,26 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Refresh live usage data for one or all profiles, show progress while refreshing, and then print the updated list
 - Inspect saved ID/access token expiration metadata with `token-status`
 - Touch one or all profiles with a minimal Codex request, save the live auth snapshot, and report whether Codex rotated the tokens
-- Set up, list, and delete managed cron jobs that run scheduled profile touches
+- Rotate saved OAuth tokens directly with `refresh-tokens`, without spending model usage
+- Set up, list, and delete managed cron jobs that keep profile tokens rotated on a schedule
 - Update the installed CLI without cloning the repository
 - Add Bash completion support for common commands and saved profile names
+
+## The golden rules of account switching
+
+1. **Never run `codex logout` — and never run bare `codex login` to switch accounts.** Both revoke the tokens currently in `auth.json` server-side, permanently killing that account's saved profile. This is the number-one way profiles die.
+2. **Log accounts in with `codex-auth add <name>`.** It stashes the live auth safely out of the way first, runs `codex login`, and saves the result as a profile — nothing gets revoked.
+3. **Swap accounts with `codex-auth switch [name]`.** It saves the outgoing account's latest tokens back to its profile before restoring the target.
+4. **Keep tokens alive with `codex-auth cron setup` (once).** Saved refresh tokens are single-use and go stale if unused for days; the cron job rotates every profile automatically, costing no model usage. Already have a codex-auth cron job? It picks up the new rotation behavior automatically — nothing to reconfigure.
+
+Typical day-one setup:
+
+```bash
+codex-auth add work        # log in to the first account, saved as 'work'
+codex-auth add personal    # log in to the second account (live auth is stashed first)
+codex-auth cron setup      # keep all profiles' tokens rotated daily
+codex-auth switch work     # swap between accounts at will
+```
 
 ## Prerequisites
 
@@ -170,6 +187,8 @@ codex-auth refresh-usage
 codex-auth refresh work --with-stats
 codex-auth token-status
 codex-auth token-status work --utc
+codex-auth refresh-tokens
+codex-auth refresh-tokens work --force
 codex-auth touch work
 codex-auth touch --all
 codex-auth cron
@@ -200,39 +219,47 @@ Run `codex-auth help` for the full command reference.
 - If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.
 - Refresh prints the updated profile list quickly by default. Pass `--with-stats` if you also want the slower local-session usage footer after the refresh.
 
-### Token status and touch
+### Token status, refresh-tokens, and touch
 
 - `codex-auth token-status [profile|--all]` shows saved ID-token and access-token expirations, last refresh time, and whether a refresh token is present. With no profile name, it lists all saved profiles.
-- `codex-auth touch <profile>|--all` switches to each target profile, runs a minimal non-interactive `codex exec` prompt in a temporary empty directory, saves the live `auth.json` back to that profile, reports whether the ID/access tokens actually changed, and then restores the profile that was active before the touch.
+- `codex-auth refresh-tokens [<profile>|--all] [--force]` rotates a profile's OAuth tokens directly via the same refresh grant the Codex CLI performs, then saves the result. By default it skips profiles whose access token still has more than 5 days of life (`CODEX_AUTH_REFRESH_TOKENS_MIN_VALID_SECONDS` overrides the threshold); `--force` always rotates. When the target profile is the currently active account, the live `auth.json` is refreshed and the snapshot healed from it, so a superseded snapshot refresh token is never replayed. This consumes no model usage.
+- `codex-auth touch <profile>|--all` switches to each target profile, runs a minimal non-interactive `codex exec` prompt in a temporary empty directory, saves the live `auth.json` back to that profile, reports whether the ID/access tokens actually changed, and then restores the profile that was active before the touch. Use it as an end-to-end verification; `refresh-tokens` is the cheaper keep-alive.
 - The touch command uses `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--skip-git-repo-check`, and a read-only sandbox to keep the request small and avoid loading MCP/user/project customizations.
 - Codex does not necessarily rotate tokens on every touch. If the current access token is still acceptable to Codex, `touch` can complete successfully and report that tokens were unchanged.
 - Touching profiles consumes a small amount of Codex usage because it sends a real request.
 
 ### Why a saved profile can go stale (refresh-token rotation)
 
-A saved profile is a point-in-time copy of Codex's `auth.json`. That file holds a short-lived access token **and** a refresh token, and OpenAI issues **one live refresh token per account**: every time Codex refreshes (or you run `codex login` again for that account, on this or another machine), a new refresh token is minted and the previous one is invalidated. A snapshot taken before that rotation still contains the old, now-dead refresh token.
+A saved profile is a point-in-time copy of Codex's `auth.json`. That file holds a short-lived access token **and** a refresh token, and OpenAI issues **one live refresh token per account**: every time Codex refreshes (or you run `codex login` again for that account, on this or another machine), a new refresh token is minted and the previous one is invalidated. A snapshot taken before that rotation still contains the old, now-dead refresh token. Replaying a superseded refresh token can get the entire grant revoked server-side, killing even the newest token.
+
+Note on limit windows: OpenAI removed the 5-hour window for paid plans on 2026-07-12 (described as temporary), which is why Plus currently shows a single weekly window. `codex-auth` labels windows from the reported `limit_window_seconds` rather than assuming durations, so if the 5-hour window returns it will display correctly again.
+
+Two additional hazards, observed with current Codex CLI versions:
+
+- **Both `codex logout` and `codex login` revoke the tokens in the live `auth.json` server-side** (they call the OAuth revoke endpoint, submitting the refresh token by preference; login has revoked existing auth before starting since Codex 0.140.0). Running `codex logout && codex login` — or even a bare `codex login` — to switch accounts manually revokes whichever account was live at that moment, including the snapshot `codex-auth` holds for it. Use `codex-auth add <profile>` instead; it stashes the live `auth.json` away before login so there is nothing to revoke.
+- **Refresh tokens are single-use.** The backend distinguishes `refresh_token_reused`, `refresh_token_invalidated`, and `refresh_token_expired`; once the live Codex instance refreshes, any older copy of the refresh token is dead. Access tokens live ~10 days and Codex proactively refreshes only when the last refresh is more than 8 days old, so a snapshot's refresh token sits unused for most of its life and the first replay of a superseded copy fails permanently. `codex-auth refresh-tokens` (and the cron jobs) rotate mid-cycle, always from the newest chain, so tokens never age out or get replayed.
 
 Because the access token stays valid for several days, a switch to a stale profile often *looks* fine at first and only fails later — the moment Codex needs to refresh, it presents the dead refresh token, the refresh is rejected, and Codex asks you to log in again. This is the root cause behind "switching accounts doesn't hold" (DEV-259); it is upstream OpenAI behavior, not something `codex-auth` can paper over by restoring the saved bytes.
 
 What `codex-auth` does about it:
 
-- **`switch` tells you when the snapshot it just restored is already expired** (or has no refresh token). It cannot know offline whether the refresh token was rotated away, so instead of silently handing over a session that will fail on first use, it prints a warning pointing at `codex-auth touch`, re-login, and `codex-auth cron setup`.
-- **`codex-auth touch <profile>` is the reliable way to keep a profile switch-ready:** it re-mints the tokens through Codex and saves the fresh snapshot. Run it before relying on a profile you haven't used in a while.
-- **`codex-auth cron setup` automates the above** so every profile is refreshed on a schedule and stays switchable. If you rotate between accounts regularly, this is the intended workflow — a daily `touch --all` keeps every snapshot alive.
-- If a profile is genuinely revoked upstream (e.g. you logged that account in elsewhere), no restore can revive it — re-authenticate with `codex login && codex-auth save <profile>`.
+- **`switch` tells you when the snapshot it just restored is already expired** (or has no refresh token). It cannot know offline whether the refresh token was rotated away, so instead of silently handing over a session that will fail on first use, it prints a warning pointing at `codex-auth refresh-tokens`, `codex-auth add`, and `codex-auth cron setup`.
+- **`codex-auth refresh-tokens <profile>` is the reliable way to keep a profile switch-ready:** it rotates the tokens directly and saves the fresh snapshot, consuming no model usage. Run it before relying on a profile you haven't used in a while.
+- **`codex-auth cron setup` automates the above** so every profile is rotated on a schedule and stays switchable. If you rotate between accounts regularly, this is the intended workflow — a daily `refresh-tokens --all` keeps every snapshot alive.
+- If a profile is genuinely revoked upstream (e.g. you logged that account in elsewhere), no restore can revive it — re-authenticate with `codex-auth add <profile>`.
 
-### Scheduled touch cron jobs
+### Scheduled token-refresh cron jobs
 
 - The cron commands require a working user `crontab` command on the machine where you schedule the job.
 - `codex-auth cron` or `codex-auth cron list` shows cron jobs managed by this tool.
-- `codex-auth cron setup` starts an interactive wizard. It lists existing managed jobs, asks whether to touch all profiles or one profile, asks for a daily or custom schedule, previews the exact cron fields and command, and then asks for confirmation. If `whiptail` is available in an interactive terminal, the wizard uses that dialog UI; otherwise it falls back to colored numbered prompts with readline-style editing where Bash supports it.
-- `codex-auth cron add --time 08:30 --yes` installs a daily scheduled `touch --all` job without prompts.
+- `codex-auth cron setup` starts an interactive wizard. It lists existing managed jobs, asks whether to refresh all profiles or one profile, asks for a daily or custom schedule, previews the exact cron fields and command, and then asks for confirmation. If `whiptail` is available in an interactive terminal, the wizard uses that dialog UI; otherwise it falls back to colored numbered prompts with readline-style editing where Bash supports it.
+- `codex-auth cron add --time 08:30 --yes` installs a daily scheduled `refresh-tokens --all` (plus usage refresh) job without prompts.
 - `codex-auth cron add --time 07:15 --profile work --yes` schedules a single profile every day.
 - `codex-auth cron add --schedule "30 8 * * 1,3,5" --yes` uses a custom cron expression, such as Monday/Wednesday/Friday at 08:30.
-- `codex-auth cron delete` lets you choose a managed job to remove; `codex-auth cron delete --all --yes` removes every codex-auth-managed touch job.
+- `codex-auth cron delete` lets you choose a managed job to remove; `codex-auth cron delete --all --yes` removes every codex-auth-managed refresh job.
 - Cron entries are wrapped in `# BEGIN codex-auth touch ...` / `# END codex-auth touch ...` markers, so delete/list operations only manage jobs created by `codex-auth`.
-- Scheduled touch output is appended to `~/.codex/accounts/cron/touch.log` by default. The cron runner prints timestamped start/end lines around the normal `touch` output.
-- Generated jobs call `codex-auth cron run ...` instead of `touch` directly so logs include the managed job id, start/end timestamps, and final exit status without making the crontab line itself more complex.
+- Scheduled refresh output is appended to `~/.codex/accounts/cron/touch.log` by default. The cron runner prints timestamped start/end lines around the refresh output.
+- Generated jobs call `codex-auth cron run ...` so logs include the managed job id, start/end timestamps, and final exit status without making the crontab line itself more complex. `cron run` rotates tokens via `refresh-tokens` and then refreshes usage; it no longer sends model requests through `codex exec`.
 - If you use a non-default `CODEX_HOME`, the generated cron command preserves it. The generated command also sets a minimal `PATH` containing the resolved `codex` executable's directory, which helps cron run `codex` installations from tools like `nvm` without depending on your interactive shell startup files.
 - Set `CODEX_AUTH_DISABLE_WHIPTAIL=1` if you prefer the plain numbered cron setup prompts even when `whiptail` is installed.
 
@@ -282,13 +309,13 @@ source "$HOME/.local/share/bash-completion/completions/codex-auth"
 - Session statistics parse rollout JSONL files under `~/.codex/sessions`
 - Pricing for session cost estimates is cached under `~/.codex/accounts/pricing-cache.json` for one week by default
 - Parsed session statistics are cached under `~/.codex/accounts/session-stats-cache.json` by default
-- Scheduled touch logs are written under `~/.codex/accounts/cron/touch.log` by default
+- Scheduled refresh logs are written under `~/.codex/accounts/cron/touch.log` by default
 - Terminal colors are enabled automatically on color-capable terminals and can be disabled with `NO_COLOR=1`
 - This project is intentionally small and practical; the code favors usefulness over ceremony
 
 ## Smoke tests
 
-- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, timezone-aware list output, refresh/list workflows, touch behavior, and managed cron setup.
+- `tests/smoke.sh` exercises the version flag, dependency report, README-style installer path, reinstall/update behavior, timezone-aware list output, refresh/list workflows, token rotation, touch behavior, and managed cron setup.
 - GitHub Actions runs that smoke test on Ubuntu and macOS for pushes and pull requests.
 
 ## License
