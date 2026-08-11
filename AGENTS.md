@@ -30,6 +30,12 @@ The versioning/tag/changelog rules below are the canonical copy for this repo; t
 - Use plain version tag names such as `0.3.0`, not `v0.3.0`.
 - Keep README guidance current for installing from a specific retained tag.
 
+## Release notes shown to users
+
+- `RELEASE_NOTES` (repo root) holds one tab-separated line per version: `version<TAB>message`.
+- Add a line only for behavior changes users must act on or know about; the message is shown on `codex-auth update` and on the update prompt for anyone upgrading from an older version.
+- Keep each message to one or two imperative sentences.
+
 ## Changelog
 
 - Maintain `CHANGELOG.md` newest-first.

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.10.2"
+EXPECTED_VERSION="0.11.0"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -131,7 +131,7 @@ create_profile_fixture() {
   local token=${5:-token_$profile_name}
   mkdir -p "$home_dir/accounts/profiles/$profile_name"
   cat > "$home_dir/accounts/profiles/$profile_name/auth.json" <<JSON
-{"tokens":{"access_token":"$token","account_id":"$account_id"}}
+{"tokens":{"access_token":"$token","refresh_token":"rt_$profile_name","account_id":"$account_id"}}
 JSON
   cat > "$home_dir/accounts/profiles/$profile_name/meta.json" <<JSON
 {"profileName":"$profile_name","email":"$email","accountId":"$account_id"}
@@ -358,6 +358,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def do_POST(self):
+        # OAuth token endpoint stub for refresh-tokens: rotates tokens and
+        # echoes the incoming refresh token so tests can assert which token
+        # chain was replayed. Refresh tokens in fail_tokens get a 401.
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = {}
+        refresh_token = str(body.get("refresh_token") or "")
+        if refresh_token == "rt_empty":
+            payload = json.dumps({}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if refresh_token in fail_tokens:
+            payload = json.dumps({
+                "error": "invalid_grant",
+                "error_description": f"refresh token invalidated for {refresh_token}",
+            }).encode("utf-8")
+            self.send_response(401)
+        else:
+            payload = json.dumps({
+                "id_token": "rotated_id",
+                "access_token": f"rotated_access_for_{refresh_token}",
+                "refresh_token": f"rotated_{refresh_token}",
+            }).encode("utf-8")
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def log_message(self, format, *args):
         return
 
@@ -479,7 +515,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-07-18"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-08-11"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
   assert_contains "$(cat "$ROOT_DIR/README.md")" "Current version: \`$EXPECTED_VERSION\`"
 }
@@ -518,7 +554,7 @@ test_save_tracks_id_and_access_token_expiry_in_meta() {
   home_dir=$(mktemp -d)
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file")
-  trap 'kill "$server_pid" 2>/dev/null || true' RETURN
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
   mkdir -p "$home_dir"
@@ -596,7 +632,7 @@ test_switch_warns_when_restored_snapshot_token_is_expired() {
   output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
     /bin/bash "$ROOT_DIR/bin/codex-auth" switch stale 2>&1)
   assert_contains "$output" "Restored snapshot for 'stale' access token expired"
-  assert_contains "$output" "codex-auth touch stale"
+  assert_contains "$output" "codex-auth refresh-tokens stale"
 
   output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NOW="$now" \
     /bin/bash "$ROOT_DIR/bin/codex-auth" switch fresh 2>&1)
@@ -764,7 +800,7 @@ test_cron_add_lists_and_deletes_managed_touch_job() {
 
   assert_contains "$output" "Installed codex-auth touch cron job 'daily-0830-all'"
   assert_contains "$output" "Cron: 30 8 * * *"
-  assert_contains "$output" "Touch command: codex-auth touch --all"
+  assert_contains "$output" "Command: codex-auth refresh-tokens --all"
   crontab_body=$(cat "$crontab_file")
   assert_contains "$crontab_body" "# unmanaged user job"
   assert_contains "$crontab_body" "# BEGIN codex-auth touch daily-0830-all"
@@ -865,7 +901,7 @@ test_cron_add_supports_specific_profile_and_custom_schedule() {
 
   assert_contains "$output" "Installed codex-auth touch cron job 'daily-0715-alpha'"
   assert_contains "$output" "Cron: 15 7 * * *"
-  assert_contains "$output" "Touch command: codex-auth touch alpha"
+  assert_contains "$output" "Command: codex-auth refresh-tokens alpha"
   crontab_body=$(cat "$crontab_file")
   assert_contains "$crontab_body" "# schedule: daily at 07:15"
   assert_contains "$crontab_body" "# target: alpha"
@@ -875,7 +911,7 @@ test_cron_add_supports_specific_profile_and_custom_schedule() {
   output=$(PATH="$fake_crontab_dir:$stub_codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_FAKE_CRONTAB_FILE="$crontab_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron add --schedule "30 8 * * 1,3,5" --id mwf-0830 --yes 2>&1)
   assert_contains "$output" "Installed codex-auth touch cron job 'mwf-0830'"
   assert_contains "$output" "30 8 * * 1,3,5"
-  assert_contains "$output" "Touch command: codex-auth touch --all"
+  assert_contains "$output" "Command: codex-auth refresh-tokens --all"
   crontab_body=$(cat "$crontab_file")
   assert_contains "$crontab_body" "# schedule: custom: 30 8 * * 1,3,5"
   assert_contains "$crontab_body" "# BEGIN codex-auth touch mwf-0830"
@@ -944,31 +980,222 @@ test_cron_setup_numbered_fallback_uses_color_when_forced() {
   assert_contains "$output" "Installed codex-auth touch cron job 'daily-0910-all'"
 }
 
-test_cron_run_prints_timestamps_and_invokes_touch() {
-  local home_dir stub_dir output log_file
+test_cron_run_prints_timestamps_and_rotates_tokens() {
+  local home_dir port_file server_pid base_url output
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  base_url="http://127.0.0.1:$(cat "$port_file")"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+
+  output=$(CODEX_HOME="$home_dir" CODEX_AUTH_TOKEN_URL="$base_url/oauth/token" \
+    CODEX_AUTH_USAGE_URL="$base_url/usage" NO_COLOR=1 \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" cron run manual-test alpha 2>&1)
+
+  assert_contains "$output" "START codex-auth refresh-tokens alpha (job=manual-test)"
+  assert_contains "$output" "Rotated tokens for 'alpha'"
+  assert_contains "$output" "END codex-auth refresh-tokens alpha (job=manual-test status=0)"
+  # Scheduled refreshes must not run model requests through codex exec.
+  assert_not_contains "$output" "Touching alpha"
+  assert_contains "$(cat "$home_dir/accounts/profiles/alpha/auth.json")" "rotated_rt_alpha"
+  assert_contains "$(cat "$home_dir/auth.json")" "rotated_rt_alpha"
+}
+
+test_refresh_tokens_rotates_saved_snapshot_via_oauth() {
+  local home_dir port_file server_pid output
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:$(cat "$port_file")/oauth/token" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens beta 2>&1)
+
+  assert_contains "$output" "Rotated tokens for 'beta'"
+  assert_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "rotated_rt_beta"
+  assert_contains "$(cat "$home_dir/accounts/profiles/beta/auth.json")" "last_refresh"
+}
+
+test_refresh_tokens_skips_profiles_with_fresh_access_tokens() {
+  local home_dir output before after
+  home_dir=$(mktemp -d)
+  # Access token valid until 2026-09-19; "now" pinned to 2026-06-01.
+  create_profile_fixture_with_jwts "$home_dir" "fresh" "fresh@example.com" "acct_fresh" 1790000000 1790000000
+  before=$(cat "$home_dir/accounts/profiles/fresh/auth.json")
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 CODEX_AUTH_NOW="2026-06-01T00:00:00Z" \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:9/unreachable" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens fresh 2>&1)
+
+  assert_contains "$output" "tokens still fresh"
+  after=$(cat "$home_dir/accounts/profiles/fresh/auth.json")
+  [[ "$before" == "$after" ]] || fail "fresh profile auth.json must not change when skipped"
+}
+
+test_refresh_tokens_force_rotates_fresh_profiles() {
+  local home_dir port_file server_pid output
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  create_profile_fixture_with_jwts "$home_dir" "fresh" "fresh@example.com" "acct_fresh" 1790000000 1790000000
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 CODEX_AUTH_NOW="2026-06-01T00:00:00Z" \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:$(cat "$port_file")/oauth/token" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens fresh --force 2>&1)
+
+  assert_contains "$output" "Rotated tokens for 'fresh'"
+  assert_contains "$(cat "$home_dir/accounts/profiles/fresh/auth.json")" "rotated_refresh_fresh"
+}
+
+test_refresh_tokens_records_revoked_refresh_token_as_issue() {
+  local home_dir port_file server_pid output status=0
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file" "rt_dead")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  create_profile_fixture "$home_dir" "dead" "dead@example.com" "acct_dead" "token_dead"
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:$(cat "$port_file")/oauth/token" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens dead 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected refresh-tokens to fail for a revoked refresh token"
+  assert_contains "$output" "Token refresh for 'dead' failed (401)"
+  assert_contains "$output" "codex-auth add dead"
+  assert_contains "$(cat "$home_dir/accounts/profiles/dead/usage.json")" "lastRefreshError"
+  # The dead refresh token must remain untouched for diagnosis.
+  assert_contains "$(cat "$home_dir/accounts/profiles/dead/auth.json")" "rt_dead"
+}
+
+test_refresh_tokens_uses_live_auth_chain_for_the_active_account() {
+  # If Codex rotated the live tokens after the snapshot was written, the
+  # snapshot's refresh token is superseded; replaying it would get the whole
+  # grant revoked. The refresh must use the live chain and heal the snapshot.
+  local home_dir port_file server_pid output
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  python3 - "$home_dir/accounts/profiles/alpha/auth.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+obj = json.load(open(path))
+obj["tokens"]["refresh_token"] = "rt_stale"
+json.dump(obj, open(path, "w"))
+PY
+  cat > "$home_dir/auth.json" <<JSON
+{"tokens":{"access_token":"token_alpha_live","refresh_token":"rt_live","account_id":"acct_alpha"}}
+JSON
+  printf 'alpha\n' > "$home_dir/accounts/current_profile"
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:$(cat "$port_file")/oauth/token" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens alpha 2>&1)
+
+  assert_contains "$output" "Rotated tokens for 'alpha'"
+  assert_contains "$(cat "$home_dir/auth.json")" "rotated_rt_live"
+  assert_contains "$(cat "$home_dir/accounts/profiles/alpha/auth.json")" "rotated_rt_live"
+  assert_not_contains "$(cat "$home_dir/accounts/profiles/alpha/auth.json")" "rt_stale"
+}
+
+test_refresh_tokens_rejects_success_response_without_tokens() {
+  # A 200 without replacement tokens must not stamp last_refresh or report a
+  # rotation — the old refresh token may already be consumed server-side.
+  local home_dir port_file server_pid output status=0 before after
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  create_profile_fixture "$home_dir" "hollow" "hollow@example.com" "acct_hollow" "token_hollow"
+  python3 - "$home_dir/accounts/profiles/hollow/auth.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+obj = json.load(open(path))
+obj["tokens"]["refresh_token"] = "rt_empty"
+json.dump(obj, open(path, "w"))
+PY
+  before=$(cat "$home_dir/accounts/profiles/hollow/auth.json")
+
+  output=$(CODEX_HOME="$home_dir" NO_COLOR=1 \
+    CODEX_AUTH_TOKEN_URL="http://127.0.0.1:$(cat "$port_file")/oauth/token" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" refresh-tokens hollow 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected refresh-tokens to fail on an empty token response"
+  assert_contains "$output" "returned no replacement tokens"
+  after=$(cat "$home_dir/accounts/profiles/hollow/auth.json")
+  [[ "$before" == "$after" ]] || fail "auth.json must be untouched when the response carries no tokens"
+}
+
+test_cron_run_preserves_rotation_error_across_usage_refresh() {
+  # A dead refresh token doesn't stop usage queries while the access token
+  # lives; the recorded rotation failure must survive the usage refresh or the
+  # user never learns rotation is failing.
+  local home_dir port_file server_pid base_url output status=0
+  home_dir=$(mktemp -d)
+  port_file=$(mktemp -u)
+  server_pid=$(start_mock_usage_server "$port_file" "rt_alpha")
+  trap 'kill "${server_pid:-}" 2>/dev/null || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  base_url="http://127.0.0.1:$(cat "$port_file")"
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+
+  output=$(CODEX_HOME="$home_dir" CODEX_AUTH_TOKEN_URL="$base_url/oauth/token" \
+    CODEX_AUTH_USAGE_URL="$base_url/usage" NO_COLOR=1 \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" cron run manual-test alpha 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected cron run to fail when token rotation fails"
+  assert_contains "$output" "Token refresh for 'alpha' failed (401)"
+  assert_contains "$(cat "$home_dir/accounts/profiles/alpha/usage.json")" "lastRefreshError"
+  assert_contains "$(cat "$home_dir/accounts/profiles/alpha/usage.json")" "refresh-tokens"
+}
+
+test_add_stashes_live_auth_before_codex_login() {
+  # `codex login`/`codex logout` revoke whatever tokens sit in auth.json at the
+  # time they run. add must move the live auth aside first so logging into a
+  # new account can never invalidate the previous account's refresh token.
+  local home_dir stub_dir output
   home_dir=$(mktemp -d)
   stub_dir=$(mktemp -d)
-  log_file="$stub_dir/codex.log"
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
   cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
   printf 'alpha\n' > "$home_dir/accounts/current_profile"
   cat > "$stub_dir/codex" <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "$CODEX_STUB_LOG"
-if [[ "${1:-}" == "exec" ]]; then
-  printf 'hi\n'
+if [[ "${1:-}" == "login" && "${2:-}" == "status" ]]; then
+  exit 0
 fi
+if [[ "${1:-}" == "login" ]]; then
+  [[ ! -f "$CODEX_HOME/auth.json" ]] || { echo "auth.json still present during login" >&2; exit 1; }
+  printf '{"tokens":{"access_token":"token_new","refresh_token":"rt_new","account_id":"acct_new"}}\n' > "$CODEX_HOME/auth.json"
+  exit 0
+fi
+exit 0
 SCRIPT
   chmod +x "$stub_dir/codex"
 
-  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" CODEX_STUB_LOG="$log_file" NO_COLOR=1 /bin/bash "$ROOT_DIR/bin/codex-auth" cron run manual-test alpha 2>&1)
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" NO_COLOR=1 \
+    CODEX_AUTH_USAGE_URL="http://127.0.0.1:9/unreachable" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" add newprof 2>&1)
 
-  assert_contains "$output" "START codex-auth touch alpha (job=manual-test)"
-  assert_contains "$output" "Touching alpha"
-  assert_contains "$output" "Tokens unchanged for 'alpha'"
-  assert_contains "$output" "END codex-auth touch alpha (job=manual-test status=0)"
-  assert_contains "$(cat "$log_file")" "exec"
+  assert_contains "$output" "Stashed current auth (profile 'alpha')"
+  assert_contains "$output" "Saved profile 'newprof'"
+  assert_contains "$(cat "$home_dir/accounts/profiles/alpha/auth.json")" "rt_alpha"
+  assert_contains "$(cat "$home_dir/accounts/profiles/newprof/auth.json")" "rt_new"
+  assert_contains "$(cat "$home_dir/auth.json")" "acct_new"
 }
 
 test_cron_implementation_avoids_nonportable_bash_and_date_flags() {
@@ -1006,6 +1233,7 @@ make_remote_release_fixture() {
   cp "$ROOT_DIR/install.sh" "$remote_dir/install.sh"
   cp "$ROOT_DIR/completions/codex-auth.bash" "$remote_dir/completions/codex-auth.bash"
   printf '%s\n' "$version" > "$remote_dir/VERSION"
+  printf '%s\tRemote release note for %s.\n0.1.0\tAncient note that must stay hidden.\n' "$version" "$version" > "$remote_dir/RELEASE_NOTES"
   printf '%s\n' "$remote_dir"
 }
 
@@ -1017,6 +1245,9 @@ test_update_command_reuses_the_installer_without_cloning() {
   PATH="$stub_codex_dir:$PATH" CODEX_AUTH_INSTALL_FROM="file://$ROOT_DIR" bash <(cat "$ROOT_DIR/install.sh") --prefix "$prefix" --skip-completions >/dev/null
   output=$(PATH="$stub_codex_dir:$PATH" NO_COLOR=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" "$prefix/bin/codex-auth" update 2>&1)
   assert_contains "$output" "Updated codex-auth $EXPECTED_VERSION → 9.9.9"
+  assert_contains "$output" "What's new in 9.9.9:"
+  assert_contains "$output" "Remote release note for 9.9.9."
+  assert_not_contains "$output" "Ancient note that must stay hidden."
   assert_not_contains "$output" "Installing codex-auth"
   [[ -x "$prefix/bin/codex-auth" ]] || fail "expected executable to still exist after codex-auth update"
   [[ "$("$prefix/bin/codex-auth" --version)" == "9.9.9" ]] || fail "expected updated binary to report 9.9.9"
@@ -1040,8 +1271,11 @@ test_update_check_prompts_once_and_declining_runs_command() {
   printf '9.9.9\n' > "$remote_dir/VERSION"
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha"
 
+  printf '9.9.9\tPrompt-time release note.\n' > "$remote_dir/RELEASE_NOTES"
   output=$(printf 'n\n' | NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_NO_UPDATE_CHECK=0 CODEX_AUTH_FORCE_UPDATE_CHECK=1 CODEX_AUTH_INSTALL_FROM="file://$remote_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" list 2>&1)
   assert_contains "$output" "codex-auth 9.9.9 is available (current $EXPECTED_VERSION). Update now?"
+  assert_contains "$output" "What's new in 9.9.9:"
+  assert_contains "$output" "Prompt-time release note."
   assert_contains "$output" "PROFILE"
   [[ -f "$home_dir/accounts/update-check" ]] || fail "expected update-check cache to be written"
 
@@ -1187,7 +1421,7 @@ test_refresh_without_args_refreshes_all_profiles_without_prompting() {
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1221,7 +1455,7 @@ JSON
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file" "token_beta")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1245,7 +1479,7 @@ JSON
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file" "token_beta")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1269,7 +1503,7 @@ test_refresh_marks_session_backfilled_percents_as_approximate() {
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file" "" "token_bare_alpha")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1335,7 +1569,7 @@ test_refresh_ignores_stale_session_snapshots() {
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file" "" "token_bare_alpha")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1359,7 +1593,7 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file" "token_beta,token_gamma")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1380,7 +1614,7 @@ test_refresh_continues_after_profile_failures_and_summarizes() {
   assert_contains "$output" "token_expired: token expired for token_gamma"
   assert_not_contains "$output" "profiles failed to refresh. See issue lines above."
   assert_not_contains "$output" "profile failed to refresh. See issue lines above."
-  assert_contains "$output" "To repair a profile token, run: codex-auth switch <profile> && codex logout && codex login && codex-auth save <profile>"
+  assert_contains "$output" "To repair a profile token, run: codex-auth add <profile>"
   assert_not_contains "$output" "beta: Unable to refresh usage for 'beta': token_expired:"
   assert_not_contains "$output" "gamma: Unable to refresh usage for 'gamma': token_expired:"
   assert_contains "$output" "PROFILE"
@@ -1438,7 +1672,7 @@ test_refresh_with_stats_flag_includes_session_footer() {
 
   port_file=$(mktemp)
   server_pid=$(start_mock_usage_server "$port_file")
-  trap 'kill "$server_pid" >/dev/null 2>&1 || true' RETURN
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   usage_url="http://127.0.0.1:$(cat "$port_file")/usage"
 
@@ -1695,7 +1929,15 @@ main() {
   test_cron_setup_wizard_installs_default_daily_all_job
   test_cron_setup_wizard_supports_whiptail_when_available
   test_cron_setup_numbered_fallback_uses_color_when_forced
-  test_cron_run_prints_timestamps_and_invokes_touch
+  test_cron_run_prints_timestamps_and_rotates_tokens
+  test_refresh_tokens_rotates_saved_snapshot_via_oauth
+  test_refresh_tokens_skips_profiles_with_fresh_access_tokens
+  test_refresh_tokens_force_rotates_fresh_profiles
+  test_refresh_tokens_records_revoked_refresh_token_as_issue
+  test_refresh_tokens_uses_live_auth_chain_for_the_active_account
+  test_refresh_tokens_rejects_success_response_without_tokens
+  test_cron_run_preserves_rotation_error_across_usage_refresh
+  test_add_stashes_live_auth_before_codex_login
   test_cron_implementation_avoids_nonportable_bash_and_date_flags
   test_list_skips_session_stats_by_default_and_with_stats_opts_in
   test_refresh_with_stats_flag_includes_session_footer

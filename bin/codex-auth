@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.10.2"
+APP_VERSION="0.11.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -15,6 +15,14 @@ CODEX_AUTH_CODEX_BIN="${CODEX_AUTH_CODEX_BIN:-codex}"
 DEFAULT_CRON_BASE_PATH="/usr/local/bin:/usr/bin:/bin"
 DEFAULT_USAGE_URL="https://chatgpt.com/backend-api/codex/usage"
 FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
+# OAuth constants matching the Codex CLI itself (extracted from the codex
+# binary); refresh-tokens performs the same grant the CLI performs on expiry.
+DEFAULT_TOKEN_URL="https://auth.openai.com/oauth/token"
+DEFAULT_OAUTH_CLIENT_ID="app_EMoamEEZ73f0CkXaXp7hrann"
+# Rotate saved tokens once the access token has less than this much life left.
+# Access tokens currently live ~10 days, so 5 days rotates mid-cycle and the
+# refresh token never sits idle long enough to be expired/invalidated.
+DEFAULT_REFRESH_TOKENS_MIN_VALID_SECONDS="${CODEX_AUTH_REFRESH_TOKENS_MIN_VALID_SECONDS:-432000}"
 DEFAULT_INSTALL_FROM_BASE="https://raw.githubusercontent.com/Fasand/codex-auth/main"
 DEFAULT_PRICING_URL="${CODEX_AUTH_PRICING_URL:-https://developers.openai.com/api/docs/pricing}"
 DEFAULT_PRICING_CACHE_PATH="${CODEX_AUTH_PRICING_CACHE_PATH:-$ACCOUNTS_DIR/pricing-cache.json}"
@@ -47,7 +55,7 @@ Commands:
   current [--utc]           Show the currently active auth profile or current auth summary
   save <name>               Save the current auth.json as a named profile
   switch [name]             Switch to a saved profile (interactive if name omitted)
-  add <name>                Run codex login, then save the result as <name>
+  add <name>                Stash live auth safely, run codex login, save the result as <name>
   refresh-usage [--utc] [--with-stats] [<name>|--all]
                             Query live usage for one profile, or all profiles when no name is given
   refresh [--utc] [--with-stats] [<name>|--all]
@@ -55,9 +63,13 @@ Commands:
   token-status [--utc] [<name>|--all]
                             Show saved ID/access token expiry metadata
                             Defaults to all profiles when no name is provided
+  refresh-tokens [<name>|--all] [--force]
+                            Rotate saved OAuth tokens via a direct refresh grant
+                            (skips profiles whose access token is still fresh;
+                            --force always rotates). Defaults to all profiles.
   touch <name>|--all        Run a minimal Codex request for profile(s), save live auth, and report whether tokens rotated
   cron [list|setup|add|delete|run]
-                            Manage scheduled touch cron jobs
+                            Manage scheduled token-refresh cron jobs
   stats [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
                             Show global session token statistics from rollout history
   statistics [--utc] [--recompute] [--period <today|7d|14d|30d|all>]
@@ -77,8 +89,13 @@ Environment:
   CODEX_AUTH_PRICING_CACHE_PATH  Override cached pricing file path
   CODEX_AUTH_PRICING_CACHE_TTL_SECONDS  Override pricing cache TTL (default: 604800)
   CODEX_AUTH_SESSION_STATS_CACHE_PATH  Override parsed session stats cache path
-  CODEX_AUTH_CODEX_BIN    Override codex executable used by touch/cron
-  CODEX_AUTH_CRON_LOG_FILE  Override scheduled touch log path
+  CODEX_AUTH_CODEX_BIN    Override codex executable used by add/touch/cron
+  CODEX_AUTH_TOKEN_URL    Override OAuth token endpoint for refresh-tokens
+  CODEX_AUTH_OAUTH_CLIENT_ID  Override OAuth client id used by refresh-tokens
+  CODEX_AUTH_REFRESH_TOKENS_MIN_VALID_SECONDS
+                          Rotate when access token has less life left than this
+                          (default: 432000 = 5 days)
+  CODEX_AUTH_CRON_LOG_FILE  Override scheduled refresh log path
   CODEX_AUTH_CRON_PATH    Override PATH used by generated cron commands
   CODEX_AUTH_DISABLE_WHIPTAIL  Set to 1 to force numbered cron setup prompts
   CODEX_AUTH_NO_UPDATE_CHECK  Set to 1 to disable the daily update check
@@ -398,6 +415,8 @@ for path in files:
             'weekly_used_percent': None if secondary.get('used_percent') is None else int(round(float(secondary.get('used_percent')))),
             'five_hour_reset_at': primary.get('resets_at'),
             'weekly_reset_at': secondary.get('resets_at'),
+            'primary_window_seconds': None if primary.get('window_minutes') is None else int(primary.get('window_minutes')) * 60,
+            'secondary_window_seconds': None if secondary.get('window_minutes') is None else int(secondary.get('window_minutes')) * 60,
             'plan_type': rate_limits.get('plan_type'),
         }
         if snapshot['five_hour_used_percent'] is not None:
@@ -447,6 +466,11 @@ def derived_from_backend(data):
         'weekly_reset_at': secondary.get('reset_at'),
         'five_hour_reset_after_seconds': primary.get('reset_after_seconds'),
         'weekly_reset_after_seconds': secondary.get('reset_after_seconds'),
+        # Window durations vary by plan now (e.g. plus = one 7-day window,
+        # free = one 30-day window); the display labels windows from these
+        # instead of assuming 5h/weekly.
+        'primary_window_seconds': primary.get('limit_window_seconds'),
+        'secondary_window_seconds': secondary.get('limit_window_seconds'),
     }
     if primary.get('used_percent') is not None:
         derived['five_hour_remaining_percent'] = max(0, 100 - int(round(float(primary.get('used_percent')))))
@@ -465,9 +489,9 @@ def make_error_message(message, *, code=None):
 
 
 def auth_relogin_message(message, *, code=None):
-    command = "codex logout && codex login && codex-auth save <profile>"
-    if profile_name:
-        command = f"codex-auth switch {profile_name} && codex logout && codex login && codex-auth save {profile_name}"
+    # `codex-auth add` stashes the live auth.json before running codex login,
+    # so re-logging one profile can never revoke another account's tokens.
+    command = f"codex-auth add {profile_name}" if profile_name else "codex-auth add <profile>"
     return make_error_message(
         f"{message} This profile needs to be logged in again. Run: {command}",
         code=code,
@@ -512,6 +536,14 @@ for url in urls:
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode('utf-8', 'replace')
             data = json.loads(raw)
+            carried_error = None
+            try:
+                previous = json.loads(Path(usage_path).read_text())
+                candidate = previous.get('lastRefreshError') if isinstance(previous, dict) else None
+                if isinstance(candidate, dict) and candidate.get('source') == 'refresh-tokens':
+                    carried_error = candidate
+            except Exception:
+                carried_error = None
             payload = {
                 'fetchedAt': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
                 'source': 'live',
@@ -533,6 +565,8 @@ for url in urls:
                         'weekly_remaining_percent',
                         'five_hour_reset_at',
                         'weekly_reset_at',
+                        'primary_window_seconds',
+                        'secondary_window_seconds',
                     ):
                         if payload['derived'].get(key) is None:
                             value = payload['session'].get(key)
@@ -540,6 +574,8 @@ for url in urls:
                                 payload['derived'][key] = value
                 except Exception:
                     pass
+            if carried_error is not None:
+                payload['lastRefreshError'] = carried_error
             Path(usage_path).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8')
             print(json.dumps(payload))
             raise SystemExit(0)
@@ -573,14 +609,15 @@ record_profile_refresh_error() {
   local profile_name=$1
   local usage_path=$2
   local message=$3
-  python3 - "$profile_name" "$usage_path" "$message" <<'PY'
+  local source=${4:-usage}
+  python3 - "$profile_name" "$usage_path" "$message" "$source" <<'PY'
 import datetime as dt
 import json
 import re
 import sys
 from pathlib import Path
 
-profile_name, usage_path, message = sys.argv[1:4]
+profile_name, usage_path, message, source = sys.argv[1:5]
 path = Path(usage_path)
 try:
     usage = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
@@ -607,6 +644,10 @@ usage['lastRefreshError'] = {
     'failedAt': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
     'summary': summary,
     'message': str(message or '').strip(),
+    # 'refresh-tokens' errors survive successful usage refreshes: a dead
+    # refresh token doesn't stop usage queries while the access token lives,
+    # and the recorded issue is how the user learns rotation is failing.
+    'source': source,
 }
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(usage, indent=2, sort_keys=True), encoding='utf-8')
@@ -682,6 +723,22 @@ def format_percent(value):
         return str(value)
 
 
+def window_label(seconds):
+    # '5h', 'weekly', '30d', ... from the window duration the backend reports.
+    if seconds in (None, '', 0):
+        return None
+    try:
+        seconds = int(seconds)
+    except Exception:
+        return None
+    if seconds % 604800 == 0:
+        weeks = seconds // 604800
+        return 'weekly' if weeks == 1 else f'{weeks}w'
+    if seconds % 86400 == 0:
+        return f'{seconds // 86400}d'
+    return f'{seconds / 3600:g}h'
+
+
 backend = usage.get('backend_derived')
 # Legacy usage.json files predate the 'endpoint' field; infer fallback
 # fetches from the recorded URL until the next refresh rewrites the file.
@@ -707,15 +764,33 @@ def percent_with_source(key):
     return text
 
 
+credits = usage.get('credits') or {}
+if credits.get('unlimited'):
+    credits_text = 'unlimited'
+else:
+    balance = str(credits.get('balance') or '').strip()
+    credits_text = balance if credits.get('has_credits') and balance not in ('', '0') else ''
+
 payload = {
     'active': is_active,
     'profile': profile_name,
     'email': meta.get('email') or '',
     'account': meta.get('accountId') or '',
     'plan': first_value(usage.get('plan_type'), session.get('plan_type')) or '',
+    'credits': credits_text,
     'five_hour': percent_with_source('five_hour_remaining_percent'),
+    'five_hour_label': window_label(first_value(
+        derived.get('primary_window_seconds'),
+        session.get('primary_window_seconds'),
+        ((usage.get('rate_limit') or {}).get('primary_window') or {}).get('limit_window_seconds'),
+    )) or '5h',
     'five_hour_reset': format_datetime(first_value(derived.get('five_hour_reset_at'), session.get('five_hour_reset_at'))),
     'weekly': percent_with_source('weekly_remaining_percent'),
+    'weekly_label': window_label(first_value(
+        derived.get('secondary_window_seconds'),
+        session.get('secondary_window_seconds'),
+        ((usage.get('rate_limit') or {}).get('secondary_window') or {}).get('limit_window_seconds'),
+    )) or 'weekly',
     'weekly_reset': format_datetime(first_value(derived.get('weekly_reset_at'), session.get('weekly_reset_at'))),
     'checked': format_datetime(usage.get('fetchedAt')),
     'token_expires': format_datetime(meta.get('tokenExpiresAt')),
@@ -765,7 +840,7 @@ def paint(text, style_name):
 
 
 def percent_style(value):
-    match = re.search(r'(\d+)', value or '')
+    match = re.search(r'(\d+)\s*%', value or '')
     if not match:
         return value
     amount = int(match.group(1))
@@ -786,13 +861,15 @@ if payload.get('account'):
     parts.append(f"account={payload['account']}")
 if payload.get('plan'):
     parts.append(f"plan={paint(payload['plan'], 'CODEX_AUTH_THEME_PLAN_STYLE')}")
+if payload.get('credits'):
+    parts.append(f"credits={paint(payload['credits'], 'CODEX_AUTH_THEME_COST_STYLE')}")
 if payload.get('five_hour'):
-    segment = f"5h {percent_style(payload['five_hour'])}"
+    segment = f"{payload.get('five_hour_label') or '5h'} {percent_style(payload['five_hour'])}"
     if payload.get('five_hour_reset'):
         segment += f" (resets {paint(payload['five_hour_reset'], 'CODEX_AUTH_THEME_RESET_STYLE')})"
     parts.append(segment)
 if payload.get('weekly'):
-    segment = f"weekly {percent_style(payload['weekly'])}"
+    segment = f"{payload.get('weekly_label') or 'weekly'} {percent_style(payload['weekly'])}"
     if payload.get('weekly_reset'):
         segment += f" (resets {paint(payload['weekly_reset'], 'CODEX_AUTH_THEME_RESET_STYLE')})"
     parts.append(segment)
@@ -838,12 +915,28 @@ def pct(value):
     except Exception:
         return str(value).rjust(4)
 
+def window_label(seconds):
+    if seconds in (None, '', 0):
+        return None
+    try:
+        seconds = int(seconds)
+    except Exception:
+        return None
+    if seconds % 604800 == 0:
+        weeks = seconds // 604800
+        return 'wk' if weeks == 1 else f'{weeks}w'
+    if seconds % 86400 == 0:
+        return f'{seconds // 86400}d'
+    return f'{seconds / 3600:g}h'
+
 active = '*' if is_active else ' '
 profile_col = ellipsize(profile_name, 24)
 email_col = ellipsize(meta.get('email') or '', 32)
+label1 = (window_label(derived.get('primary_window_seconds')) or '5h').ljust(3)
+label2 = (window_label(derived.get('secondary_window_seconds')) or 'wk').ljust(3)
 fiveh_col = pct(derived.get('five_hour_remaining_percent'))
 weekly_col = pct(derived.get('weekly_remaining_percent'))
-display = f"{active} {profile_col}  {email_col}  5h {fiveh_col}  wk {weekly_col}"
+display = f"{active} {profile_col}  {email_col}  {label1} {fiveh_col}  {label2} {weekly_col}"
 print(f"{profile_name}	{display}")
 PY
 }
@@ -1033,7 +1126,7 @@ def paint(text, style_name):
 
 
 def percent_style(value):
-    match = re.search(r'(\d+)', value or '')
+    match = re.search(r'(\d+)\s*%', value or '')
     if not match:
         return value
     amount = int(match.group(1))
@@ -1055,15 +1148,25 @@ healthy_rows = [row for row in rows if not row.get('issue')]
 issue_rows = [row for row in rows if row.get('issue')]
 display_rows = healthy_rows + issue_rows
 
+# Window durations vary per plan, so the label travels in the cell
+# ('weekly 97%', '30d 0%') under a generic LIMIT header.
+for row in display_rows:
+    for value_key, label_key, cell_key in (
+        ('five_hour', 'five_hour_label', 'five_hour_cell'),
+        ('weekly', 'weekly_label', 'weekly_cell'),
+    ):
+        value = row.get(value_key) or ''
+        row[cell_key] = f"{row.get(label_key) or ''} {value}".strip() if value else ''
+
 profile_plain_cells = [("* " if row.get('active') else "  ") + (row.get('profile') or '') for row in display_rows]
-headers = ['PROFILE', 'EMAIL', 'PLAN', '5H', 'RESET', 'WEEKLY', 'RESET', 'CHECKED']
+headers = ['PROFILE', 'EMAIL', 'PLAN', 'LIMIT', 'RESET', 'LIMIT 2', 'RESET', 'CHECKED']
 columns = [
     profile_plain_cells,
     [row.get('email') or '' for row in display_rows],
     [row.get('plan') or '' for row in display_rows],
-    [row.get('five_hour') or '' for row in display_rows],
+    [row.get('five_hour_cell') or '' for row in display_rows],
     [row.get('five_hour_reset') or '' for row in display_rows],
-    [row.get('weekly') or '' for row in display_rows],
+    [row.get('weekly_cell') or '' for row in display_rows],
     [row.get('weekly_reset') or '' for row in display_rows],
     [row.get('checked') or '' for row in display_rows],
 ]
@@ -1099,9 +1202,9 @@ def render_row(index, header=False):
         headers[0] if header else pad(profile_plain_cells[index], widths[0]),
         headers[1] if header else pad(row.get('email') or '', widths[1]),
         headers[2] if header else pad(row.get('plan') or '', widths[2]),
-        headers[3] if header else pad(row.get('five_hour') or '', widths[3]),
+        headers[3] if header else pad(row.get('five_hour_cell') or '', widths[3]),
         headers[4] if header else pad(row.get('five_hour_reset') or '', widths[4]),
-        headers[5] if header else pad(row.get('weekly') or '', widths[5]),
+        headers[5] if header else pad(row.get('weekly_cell') or '', widths[5]),
         headers[6] if header else pad(row.get('weekly_reset') or '', widths[6]),
         headers[7] if header else pad(row.get('checked') or '', widths[7]),
     ]
@@ -1112,12 +1215,12 @@ def render_row(index, header=False):
         values[0] = profile_cell(row) + (' ' * max(0, widths[0] - len(profile_plain_cells[index])))
         if row.get('plan'):
             values[2] = paint(pad(row.get('plan') or '', widths[2]), 'CODEX_AUTH_THEME_PLAN_STYLE')
-        if row.get('five_hour'):
-            values[3] = percent_style(pad(row.get('five_hour') or '', widths[3]))
+        if row.get('five_hour_cell'):
+            values[3] = percent_style(pad(row.get('five_hour_cell') or '', widths[3]))
         if row.get('five_hour_reset'):
             values[4] = paint(pad(row.get('five_hour_reset') or '', widths[4]), 'CODEX_AUTH_THEME_RESET_STYLE')
-        if row.get('weekly'):
-            values[5] = percent_style(pad(row.get('weekly') or '', widths[5]))
+        if row.get('weekly_cell'):
+            values[5] = percent_style(pad(row.get('weekly_cell') or '', widths[5]))
         if row.get('weekly_reset'):
             values[6] = paint(pad(row.get('weekly_reset') or '', widths[6]), 'CODEX_AUTH_THEME_RESET_STYLE')
         if row.get('checked'):
@@ -1918,7 +2021,7 @@ choose_profile_interactive() {
   local active_name=${1:-}
   local entries_file use_fzf=0 name
   entries_file=$(mktemp)
-  printf $'PROFILE\t  PROFILE                   EMAIL                             5H      WEEKLY\n' > "$entries_file"
+  printf $'PROFILE\t  PROFILE                   EMAIL                             LIMIT     LIMIT 2\n' > "$entries_file"
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     profile_switch_row_tsv "$name" "$active_name" >> "$entries_file"
@@ -2044,9 +2147,9 @@ PY
   [[ -n "$reason" ]] || return 0
   note "⚠ Restored snapshot for '$profile_name' $reason."
   note "  Codex will try to refresh on first use. If that refresh token was rotated by a newer login, the refresh fails and Codex will ask you to re-authenticate."
-  note "  Verify/repair now:  codex-auth touch $profile_name   (re-mints the token via Codex)"
-  note "  Or re-login:        codex login && codex-auth save $profile_name"
-  note "  Keep snapshots fresh automatically:  codex-auth cron setup"
+  note "  Verify/repair now:  codex-auth refresh-tokens $profile_name"
+  note "  Or re-login:        codex-auth add $profile_name"
+  note "  Keep tokens fresh automatically:  codex-auth cron setup"
 }
 
 switch_profile() {
@@ -2093,11 +2196,60 @@ add_profile() {
   local profile_name=$1
   validate_profile_name "$profile_name"
   ensure_dirs
+
+  # Stash the live auth.json away before codex login runs: login/logout revoke
+  # whatever tokens they find in auth.json server-side, which is exactly how a
+  # previously working profile gets its refresh token invalidated. With no
+  # auth.json present there is nothing to revoke.
+  local stash="" outgoing=""
+  if [[ -f "$AUTH_FILE" ]]; then
+    outgoing=$(find_matching_profile || true)
+    if [[ -z "$outgoing" && -f "$CURRENT_PROFILE_FILE" ]]; then
+      local marker_name
+      marker_name=$(cat "$CURRENT_PROFILE_FILE")
+      if [[ -n "$marker_name" && -d "$(profile_dir "$marker_name")" ]] \
+        && live_auth_matches_profile "$AUTH_FILE" "$(profile_meta_path "$marker_name")"; then
+        # The live tokens rotated since the snapshot was written — capture the
+        # newest chain before letting codex login replace auth.json.
+        cp "$AUTH_FILE" "$(profile_auth_path "$marker_name")"
+        write_meta_file "$marker_name" "$(profile_auth_path "$marker_name")" "$(profile_meta_path "$marker_name")"
+        outgoing=$marker_name
+      fi
+    fi
+    # Stable path (not mktemp): survives interrupts, and the trap below puts it
+    # back if codex login is cancelled or killed so the live tokens are never
+    # lost — this may be the only copy when the auth matched no profile.
+    stash="$ACCOUNTS_DIR/auth.json.pre-add"
+    cp "$AUTH_FILE" "$stash"
+    chmod 600 "$stash" 2>/dev/null || true
+    rm -f "$AUTH_FILE"
+    trap '[[ -f "$AUTH_FILE" ]] || cp "'"$stash"'" "$AUTH_FILE" 2>/dev/null || true' EXIT INT TERM
+    if [[ -n "$outgoing" ]]; then
+      note "Stashed current auth (profile '$outgoing') before login"
+    else
+      note "Stashed current auth.json before login (not saved as any profile)"
+    fi
+  fi
+
   note "Starting codex login for profile '$profile_name'..."
-  codex login
-  codex login status >/dev/null 2>&1 || die "codex login did not complete successfully"
-  require_auth_file
+  local login_ok=1
+  "$CODEX_AUTH_CODEX_BIN" login || login_ok=0
+  if [[ $login_ok -eq 1 ]]; then
+    "$CODEX_AUTH_CODEX_BIN" login status >/dev/null 2>&1 || login_ok=0
+  fi
+  if [[ $login_ok -eq 0 || ! -f "$AUTH_FILE" ]]; then
+    if [[ -n "$stash" ]]; then
+      cp "$stash" "$AUTH_FILE"
+      rm -f "$stash"
+      trap - EXIT INT TERM
+      note "codex login failed — restored previous auth.json"
+    fi
+    die "codex login did not complete successfully"
+  fi
   save_profile "$profile_name"
+  # Only discard the stash once the new profile is safely saved.
+  [[ -z "$stash" ]] || rm -f "$stash"
+  trap - EXIT INT TERM
   render_profile_line "$profile_name" "$profile_name"
 }
 
@@ -2167,7 +2319,7 @@ refresh_usage_command() {
   list_profiles "$use_utc" "$include_stats"
 
   if (( failure_count > 0 )); then
-    note "To repair a profile token, run: codex-auth switch <profile> && codex logout && codex login && codex-auth save <profile>"
+    note "To repair a profile token, run: codex-auth add <profile>  (stashes live auth first; never use bare 'codex logout' to switch accounts)"
     return 1
   fi
   return 0
@@ -2386,8 +2538,267 @@ sync_live_auth_to_profile_snapshot() {
   auth_path=$(profile_auth_path "$profile_name")
   meta_path=$(profile_meta_path "$profile_name")
   [[ -d "$(profile_dir "$profile_name")" ]] || die "Unknown profile '$profile_name'"
+  # A concurrent Codex session can rewrite the live auth.json with a different
+  # account's tokens mid-operation; never sync those into this snapshot.
+  if [[ -f "$meta_path" ]] && ! live_auth_matches_profile "$AUTH_FILE" "$meta_path"; then
+    note "live auth.json does not belong to '$profile_name' — skipped snapshot sync"
+    return 1
+  fi
   cp "$AUTH_FILE" "$auth_path"
   write_meta_file "$profile_name" "$auth_path" "$meta_path"
+}
+
+# Perform the same OAuth refresh grant the Codex CLI performs when its access
+# token expires, against the auth file at $1, updating it in place (atomic
+# rename) on success. Prints a one-line JSON status to stdout:
+#   {"status":"rotated","changed":[...]} | {"status":"fresh","valid_seconds":N}
+# Exits non-zero with a message on stderr when the refresh fails.
+refresh_tokens_python() {
+  local auth_path=$1
+  local mode=${2:-auto}
+  local profile_name=${3:-}
+  python3 - "$auth_path" "$mode" "$profile_name" \
+    "${CODEX_AUTH_TOKEN_URL:-$DEFAULT_TOKEN_URL}" \
+    "${CODEX_AUTH_OAUTH_CLIENT_ID:-$DEFAULT_OAUTH_CLIENT_ID}" \
+    "$DEFAULT_REFRESH_TOKENS_MIN_VALID_SECONDS" <<'PY'
+import base64
+import datetime as dt
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+auth_path, mode, profile_name, token_url, client_id, min_valid = sys.argv[1:7]
+path = Path(auth_path)
+obj = json.loads(path.read_text())
+tokens = obj.get('tokens') if isinstance(obj, dict) else None
+if not isinstance(tokens, dict) or not tokens.get('refresh_token'):
+    raise SystemExit(f"No refresh token in {auth_path}")
+
+
+def jwt_exp(token):
+    if not isinstance(token, str) or '.' not in token:
+        return None
+    parts = token.split('.')
+    if len(parts) < 2 or not parts[1]:
+        return None
+    payload = parts[1] + '=' * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return None
+    return claims.get('exp') if isinstance(claims, dict) else None
+
+
+def parse_now(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if text.isdigit():
+        return dt.datetime.fromtimestamp(int(text), tz=dt.timezone.utc)
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+now = parse_now(os.environ.get('CODEX_AUTH_NOW')) or dt.datetime.now(dt.timezone.utc)
+now_epoch = int(now.timestamp())
+
+access_exp = jwt_exp(tokens.get('access_token'))
+if mode != 'force' and access_exp is not None:
+    valid_seconds = access_exp - now_epoch
+    if valid_seconds > int(min_valid):
+        print(json.dumps({'status': 'fresh', 'valid_seconds': valid_seconds}))
+        raise SystemExit(0)
+
+original_refresh_token = tokens['refresh_token']
+original_account_id = tokens.get('account_id')
+body = json.dumps({
+    'client_id': client_id,
+    'grant_type': 'refresh_token',
+    'refresh_token': original_refresh_token,
+    'scope': 'openid profile email',
+}).encode()
+req = urllib.request.Request(token_url, data=body, headers={'Content-Type': 'application/json'})
+label = f" for '{profile_name}'" if profile_name else ''
+try:
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode('utf-8', 'replace'))
+except urllib.error.HTTPError as exc:
+    detail = exc.read().decode('utf-8', 'replace')
+    try:
+        parsed = json.loads(detail)
+        detail = parsed.get('error_description') or parsed.get('error') or detail
+    except Exception:
+        pass
+    detail = ' '.join(str(detail).split())[:200]
+    raise SystemExit(f"Token refresh{label} failed ({exc.code}): {detail}")
+except Exception as exc:
+    raise SystemExit(f"Token refresh{label} failed: {exc}")
+
+# A 200 without replacement tokens must not be treated as a rotation: the old
+# refresh token may already be consumed and stamping last_refresh would mask it.
+if not data.get('access_token') or not data.get('refresh_token'):
+    raise SystemExit(f"Token refresh{label} returned no replacement tokens — {auth_path} left untouched")
+
+changed = []
+for key in ('id_token', 'access_token', 'refresh_token'):
+    value = data.get(key)
+    if value and value != tokens.get(key):
+        tokens[key] = value
+        changed.append(key)
+obj['last_refresh'] = now.strftime('%Y-%m-%dT%H:%M:%S.%f000Z')
+
+# If a concurrent Codex session rewrote the file between our read and this
+# write (different refresh token or account), don't clobber it — park the
+# rotated chain in a sidecar so the new tokens are never lost.
+target = path
+try:
+    current_tokens = (json.loads(path.read_text()) or {}).get('tokens') or {}
+    if (
+        current_tokens.get('refresh_token') != original_refresh_token
+        or current_tokens.get('account_id') != original_account_id
+    ):
+        target = path.with_name(path.name + '.rotated')
+except FileNotFoundError:
+    pass
+except Exception:
+    pass
+
+tmp_path = target.with_name(target.name + '.tmp')
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, 'w') as fh:
+    fh.write(json.dumps(obj, indent=2))
+os.replace(tmp_path, target)
+if target != path:
+    raise SystemExit(
+        f"Auth file changed during refresh{label} (concurrent session?) — rotated tokens saved to {target}; resolve manually"
+    )
+print(json.dumps({'status': 'rotated', 'changed': changed}))
+PY
+}
+
+refresh_tokens_for_profile() {
+  local profile_name=$1
+  local mode=${2:-auto}
+  validate_profile_name "$profile_name"
+  [[ -d "$(profile_dir "$profile_name")" ]] || die "Unknown profile '$profile_name'"
+  local auth_path meta_path usage_path target_is_live=0 result status=0 error_file
+  auth_path=$(profile_auth_path "$profile_name")
+  meta_path=$(profile_meta_path "$profile_name")
+  usage_path=$(profile_usage_path "$profile_name")
+  [[ -f "$auth_path" ]] || die "Profile '$profile_name' is missing auth.json"
+
+  # When the live auth.json belongs to this account it holds the newest token
+  # chain (Codex may have rotated it since the snapshot was written). Refresh
+  # the live file and sync back, instead of replaying the snapshot's possibly
+  # superseded refresh token — replaying an old token gets the whole grant
+  # revoked server-side.
+  if [[ -f "$AUTH_FILE" ]] && live_auth_matches_profile "$AUTH_FILE" "$meta_path"; then
+    target_is_live=1
+  fi
+
+  error_file=$(mktemp)
+  if [[ $target_is_live -eq 1 ]]; then
+    result=$(refresh_tokens_python "$AUTH_FILE" "$mode" "$profile_name" 2>"$error_file") || status=$?
+    if [[ $status -eq 0 ]]; then
+      cp "$AUTH_FILE" "$auth_path"
+      write_meta_file "$profile_name" "$auth_path" "$meta_path"
+    fi
+  else
+    result=$(refresh_tokens_python "$auth_path" "$mode" "$profile_name" 2>"$error_file") || status=$?
+    if [[ $status -eq 0 ]]; then
+      write_meta_file "$profile_name" "$auth_path" "$meta_path"
+    fi
+  fi
+
+  if [[ $status -ne 0 ]]; then
+    local message
+    message=$(cat "$error_file")
+    rm -f "$error_file"
+    message=${message//$'\n'/ }
+    [[ -n "$message" ]] || message="Token refresh for '$profile_name' failed"
+    record_profile_refresh_error "$profile_name" "$usage_path" "$message" refresh-tokens
+    note "$(style_text CODEX_AUTH_THEME_ISSUE_STYLE "$message")"
+    note "  Re-login when convenient:  codex-auth add $profile_name"
+    return 1
+  fi
+  rm -f "$error_file"
+  # A successful rotation clears any earlier rotation failure for this profile.
+  python3 - "$usage_path" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    usage = json.loads(path.read_text())
+except Exception:
+    raise SystemExit(0)
+error = usage.get('lastRefreshError') if isinstance(usage, dict) else None
+if isinstance(error, dict) and error.get('source') == 'refresh-tokens':
+    del usage['lastRefreshError']
+    path.write_text(json.dumps(usage, indent=2, sort_keys=True), encoding='utf-8')
+PY
+
+  python3 - "$profile_name" "$result" <<'PY' >&2
+import json
+import sys
+
+profile_name, raw = sys.argv[1:3]
+info = json.loads(raw) if raw else {}
+if info.get('status') == 'fresh':
+    hours = int(info.get('valid_seconds') or 0) // 3600
+    print(f"'{profile_name}' tokens still fresh (access token valid ~{hours}h) — skipped")
+else:
+    changed = ', '.join(info.get('changed') or []) or 'nothing'
+    print(f"Rotated tokens for '{profile_name}' ({changed} changed)")
+PY
+}
+
+refresh_tokens_command() {
+  ensure_dirs
+  local target=${1:-"--all"}
+  local mode=${2:-auto}
+  local -a targets=()
+  local name
+  if [[ "$target" == "--all" ]]; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      targets+=("$name")
+    done < <(list_profile_names)
+  else
+    validate_profile_name "$target"
+    [[ -d "$(profile_dir "$target")" ]] || die "Unknown profile '$target'"
+    targets+=("$target")
+  fi
+  (( ${#targets[@]} > 0 )) || die "No saved profiles to refresh"
+  for name in "${targets[@]}"; do
+    [[ -f "$(profile_auth_path "$name")" ]] || die "Profile '$name' is missing auth.json"
+  done
+
+  local lock_dir="$ACCOUNTS_DIR/refresh-tokens.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "Another codex-auth refresh-tokens operation is already running (lock: $lock_dir)"
+  fi
+  # An interrupt mid-loop must not leave a stale lock that permanently blocks
+  # cron rotation. (A SIGKILL still can; remove the directory by hand then.)
+  trap 'rmdir "'"$lock_dir"'" 2>/dev/null || true' EXIT INT TERM
+  local failure_count=0
+  for name in "${targets[@]}"; do
+    refresh_tokens_for_profile "$name" "$mode" || failure_count=$((failure_count + 1))
+  done
+  rmdir "$lock_dir" 2>/dev/null || true
+  trap - EXIT INT TERM
+  (( failure_count == 0 ))
 }
 
 report_touch_token_change() {
@@ -2455,8 +2866,13 @@ touch_one_profile() {
     --sandbox read-only \
     -C "$tmp_dir" \
     'Reply with exactly: hi' >"$codex_output" 2>&1; then
-    sync_live_auth_to_profile_snapshot "$profile_name"
-    report_touch_token_change "$profile_name" "$before_auth" "$(profile_auth_path "$profile_name")" >&2
+    if sync_live_auth_to_profile_snapshot "$profile_name"; then
+      report_touch_token_change "$profile_name" "$before_auth" "$(profile_auth_path "$profile_name")" >&2
+    else
+      # Identity guard refused the sync — the live auth.json belongs to a
+      # different account, so this touch cannot be trusted as a success.
+      status=1
+    fi
   else
     status=$?
     cat "$codex_output" >&2
@@ -2572,15 +2988,15 @@ cron_usage() {
   cat <<USAGE
 Usage: codex-auth cron [list|setup|add|delete|run]
 
-Manage scheduled codex-auth touch cron jobs.
+Manage scheduled codex-auth token-refresh cron jobs.
 
 Commands:
-  cron                         List codex-auth-managed touch cron jobs
-  cron list                    List codex-auth-managed touch cron jobs
-  cron setup                   Interactive wizard to create a touch cron job
-  cron add [options]           Add a touch cron job non-interactively
+  cron                         List codex-auth-managed refresh cron jobs
+  cron list                    List codex-auth-managed refresh cron jobs
+  cron setup                   Interactive wizard to create a refresh cron job
+  cron add [options]           Add a refresh cron job non-interactively
   cron delete [<job-id>|--all] [--yes]
-                               Delete managed touch cron job(s)
+                               Delete managed refresh cron job(s)
   cron run <job-id> <profile|--all>
                                Internal cron runner with timestamped output
 
@@ -2588,8 +3004,8 @@ Add options:
   --time HH:MM                 24-hour time for daily schedules
   --daily                      Run every day (default)
   --schedule "M H DOM MON DOW" Use a custom five-field cron schedule
-  --all                        Touch all profiles (default)
-  --profile <name>             Touch one saved profile
+  --all                        Refresh all profiles (default)
+  --profile <name>             Refresh one saved profile
   --id <job-id>                Use an explicit managed job id
   --yes, -y                    Skip confirmation
 USAGE
@@ -2932,9 +3348,9 @@ cron_validate_target() {
 cron_touch_command_label() {
   local target=$1
   if [[ "$target" == "--all" ]]; then
-    printf 'codex-auth touch --all\n'
+    printf 'codex-auth refresh-tokens --all\n'
   else
-    printf 'codex-auth touch %s\n' "$target"
+    printf 'codex-auth refresh-tokens %s\n' "$target"
   fi
 }
 
@@ -2988,7 +3404,7 @@ cron_print_preview() {
   note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "ID:") $(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$job_id")"
   note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Schedule:") $(style_text CODEX_AUTH_THEME_RESET_STYLE "$schedule_description")"
   note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Cron:") $(style_text CODEX_AUTH_THEME_ACTIVE_STYLE "$cron_expr")"
-  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Touch command:") $(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$touch_label")"
+  note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Command:") $(style_text CODEX_AUTH_THEME_PROFILE_STYLE "$touch_label")"
   note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Cron command:") $runner_command"
   note "  $(style_text CODEX_AUTH_THEME_DIM_STYLE "Log:") $(style_text CODEX_AUTH_THEME_RESET_STYLE "$CRON_LOG_FILE")"
 }
@@ -3535,11 +3951,15 @@ cron_run_command() {
   touch_label=$(cron_touch_command_label "$target")
   started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
   printf '[%s] START %s (job=%s)\n' "$started_at" "$touch_label" "$job_id"
-  if touch_command "$target"; then
+  # Rotate tokens directly via the OAuth refresh grant instead of running a
+  # model request through `codex exec`: it keeps refresh tokens alive without
+  # burning plan usage, and avoids racing a live Codex session over auth.json.
+  if refresh_tokens_command "$target"; then
     status=0
   else
     status=$?
   fi
+  refresh_usage_command "$target" 0 0 || status=1
   ended_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
   printf '[%s] END %s (job=%s status=%s)\n' "$ended_at" "$touch_label" "$job_id" "$status"
   return "$status"
@@ -3642,6 +4062,7 @@ update_self() {
     else
       note "Updated codex-auth from $(style_text CODEX_AUTH_THEME_DIM_STYLE "$from_base")"
     fi
+    print_release_notes_since "$APP_VERSION" "$from_base"
   else
     status=$?
     cat "$update_log" >&2
@@ -3649,6 +4070,54 @@ update_self() {
     note "codex-auth update failed (installer output above)"
     return "$status"
   fi
+}
+
+# Print user-facing release notes for every version newer than $1, fetched
+# from $2/RELEASE_NOTES (tab-separated `version<TAB>message` lines). Shown on
+# update and on the update prompt so behavior changes reach users who never
+# read the changelog. Best effort: any failure prints nothing.
+print_release_notes_since() {
+  local old_version=$1
+  local from_base=$2
+  # The update prompt and update_self both call this; show notes only once.
+  [[ "${CODEX_AUTH_RELEASE_NOTES_SHOWN:-0}" != "1" ]] || return 0
+  CODEX_AUTH_RELEASE_NOTES_SHOWN=1
+  local notes
+  notes=$(curl -fsSL --connect-timeout 2 --max-time 4 "$from_base/RELEASE_NOTES" 2>/dev/null) || return 0
+  [[ -n "$notes" ]] || return 0
+  CODEX_AUTH_RELEASE_NOTES="$notes" python3 - "$old_version" <<'PY' >&2 || true
+import os
+import re
+import sys
+
+old_version = sys.argv[1]
+
+
+def parse(value):
+    value = value.strip()
+    if not re.fullmatch(r'\d+(\.\d+)*', value):
+        return None
+    return tuple(int(part) for part in value.split('.'))
+
+
+old = parse(old_version)
+if old is None:
+    raise SystemExit(0)
+
+lines = []
+for line in os.environ.get('CODEX_AUTH_RELEASE_NOTES', '').splitlines():
+    if '\t' not in line:
+        continue
+    version, message = line.split('\t', 1)
+    parsed = parse(version)
+    if parsed is None or parsed <= old or not message.strip():
+        continue
+    lines.append((parsed, version.strip(), message.strip()))
+
+for _, version, message in sorted(lines):
+    print(f"\nWhat's new in {version}:")
+    print(f"  {message}")
+PY
 }
 
 is_newer_version() {
@@ -3722,6 +4191,7 @@ maybe_check_for_update() {
   [[ -n "$remote_version" ]] || return 0
   is_newer_version "$APP_VERSION" "$remote_version" || return 0
 
+  print_release_notes_since "$APP_VERSION" "$from_base"
   printf 'codex-auth %s is available (current %s). Update now? [Y/n] ' \
     "$(style_text CODEX_AUTH_THEME_PERCENT_OK_STYLE "$remote_version")" \
     "$(style_text CODEX_AUTH_THEME_DIM_STYLE "$APP_VERSION")" >&2
@@ -3867,6 +4337,32 @@ main() {
         shift
       done
       token_status_command "$token_status_target" "$token_status_use_utc"
+      ;;
+    refresh-tokens)
+      shift
+      local refresh_tokens_target=""
+      local refresh_tokens_mode="auto"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force)
+            [[ "$refresh_tokens_mode" == "auto" ]] || die "Usage: codex-auth refresh-tokens [<name>|--all] [--force]"
+            refresh_tokens_mode="force"
+            ;;
+          --all)
+            [[ -z "$refresh_tokens_target" ]] || die "Usage: codex-auth refresh-tokens [<name>|--all] [--force]"
+            refresh_tokens_target="--all"
+            ;;
+          -*)
+            die "Usage: codex-auth refresh-tokens [<name>|--all] [--force]"
+            ;;
+          *)
+            [[ -z "$refresh_tokens_target" ]] || die "Usage: codex-auth refresh-tokens [<name>|--all] [--force]"
+            refresh_tokens_target="$1"
+            ;;
+        esac
+        shift
+      done
+      refresh_tokens_command "${refresh_tokens_target:---all}" "$refresh_tokens_mode"
       ;;
     touch)
       shift
