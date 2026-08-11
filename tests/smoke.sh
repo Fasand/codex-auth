@@ -461,8 +461,8 @@ test_readme_documents_installing_a_specific_tagged_version() {
   local readme
   readme=$(cat "$ROOT_DIR/README.md")
   assert_contains "$readme" "Install a specific tagged version"
-  assert_contains "$readme" "https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0/install.sh"
-  assert_contains "$readme" "--from https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0"
+  assert_contains "$readme" "https://raw.githubusercontent.com/Fasand/codex-auth/0.11.0/install.sh"
+  assert_contains "$readme" "--from https://raw.githubusercontent.com/Fasand/codex-auth/0.11.0"
 }
 
 test_version_flag_reports_the_current_version() {
@@ -526,8 +526,8 @@ test_agents_md_captures_repo_workflow() {
   assert_contains "$agents" 'Do not work directly on `main`.'
   assert_contains "$agents" 'Every PR should include a short self-test command'
   assert_contains "$agents" 'Maintain `CHANGELOG.md` newest-first.'
-  assert_contains "$agents" 'For each `0.x` minor line, keep tags for `0.x.0` and the latest `0.x.y` release in that line.'
-  assert_contains "$agents" 'If a newer patch release becomes the latest in a `0.x` line, delete the superseded latest patch tag and create the new latest patch tag for that line.'
+  assert_contains "$agents" 'Keep tags only for the current and previous `0.x` minor lines'
+  assert_contains "$agents" 'when a newer patch becomes the latest in a line, delete the superseded patch tag'
 }
 
 test_completion_lists_update_command() {

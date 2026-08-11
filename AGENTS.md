@@ -25,10 +25,10 @@ The versioning/tag/changelog rules below are the canonical copy for this repo; t
 
 ## Release tags
 
-- For each `0.x` minor line, keep tags for `0.x.0` and the latest `0.x.y` release in that line.
-- If a newer patch release becomes the latest in a `0.x` line, delete the superseded latest patch tag and create the new latest patch tag for that line.
-- Use plain version tag names such as `0.3.0`, not `v0.3.0`.
-- Keep README guidance current for installing from a specific retained tag.
+- Keep tags only for the current and previous `0.x` minor lines: `0.x.0` plus the latest `0.x.y` in each.
+- When a new minor line starts, delete all tags from lines older than the previous one; when a newer patch becomes the latest in a line, delete the superseded patch tag.
+- Use plain version tag names such as `0.11.0`, not `v0.11.0`.
+- Keep README guidance current for installing from a specific retained tag (the example must reference a tag that still exists).
 
 ## Release notes shown to users
 
