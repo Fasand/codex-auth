@@ -140,11 +140,11 @@ The check never runs for scripts, pipes, or cron jobs (interactive terminals onl
 
 ## Install a specific tagged version
 
-The repository keeps retained release tags so you can install specific historical versions when needed. Use the same raw GitHub pattern, but replace `main` with a tag such as `0.3.0`:
+The repository keeps retained release tags so you can install specific historical versions when needed. Use the same raw GitHub pattern, but replace `main` with a tag such as `0.11.0`:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0/install.sh) \
-  --from https://raw.githubusercontent.com/Fasand/codex-auth/0.3.0
+bash <(curl -fsSL https://raw.githubusercontent.com/Fasand/codex-auth/0.11.0/install.sh) \
+  --from https://raw.githubusercontent.com/Fasand/codex-auth/0.11.0
 ```
 
 You can also install any other retained tag the same way:
