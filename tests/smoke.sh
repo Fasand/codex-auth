@@ -527,7 +527,7 @@ test_agents_md_captures_repo_workflow() {
   assert_contains "$agents" 'Every PR should include a short self-test command'
   assert_contains "$agents" 'Maintain `CHANGELOG.md` newest-first.'
   assert_contains "$agents" 'Keep tags only for the current and previous `0.x` minor lines'
-  assert_contains "$agents" 'If a newer patch release becomes the latest in a `0.x` line, delete the superseded latest patch tag and create the new latest patch tag for that line.'
+  assert_contains "$agents" 'when a newer patch becomes the latest in a line, delete the superseded patch tag'
 }
 
 test_completion_lists_update_command() {
