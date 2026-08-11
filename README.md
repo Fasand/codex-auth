@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.11.0`
+Current version: `0.11.1`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -26,7 +26,7 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 ## The golden rules of account switching
 
 1. **Never run `codex logout` — and never run bare `codex login` to switch accounts.** Both revoke the tokens currently in `auth.json` server-side, permanently killing that account's saved profile. This is the number-one way profiles die.
-2. **Log accounts in with `codex-auth add <name>`.** It stashes the live auth safely out of the way first, runs `codex login`, and saves the result as a profile — nothing gets revoked.
+2. **Log accounts in with `codex-auth add <name>`.** It stashes the live auth safely out of the way first, runs `codex login`, and saves the result as a profile — nothing gets revoked. On headless or remote machines (WSL, SSH) where the browser + localhost callback flow fails, use `codex-auth add <name> --device-auth` for the device-code flow instead.
 3. **Swap accounts with `codex-auth switch [name]`.** It saves the outgoing account's latest tokens back to its profile before restoring the target.
 4. **Keep tokens alive with `codex-auth cron setup` (once).** Saved refresh tokens are single-use and go stale if unused for days; the cron job rotates every profile automatically, costing no model usage. Already have a codex-auth cron job? It picks up the new rotation behavior automatically — nothing to reconfigure.
 

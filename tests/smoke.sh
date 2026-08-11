@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.11.0"
+EXPECTED_VERSION="0.11.1"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -1162,6 +1162,63 @@ test_cron_run_preserves_rotation_error_across_usage_refresh() {
   assert_contains "$(cat "$home_dir/accounts/profiles/alpha/usage.json")" "refresh-tokens"
 }
 
+test_add_device_auth_passes_flag_to_codex_login() {
+  local home_dir stub_dir output log_file
+  home_dir=$(mktemp -d)
+  stub_dir=$(mktemp -d)
+  log_file="$stub_dir/codex.log"
+  cat > "$stub_dir/codex" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$CODEX_STUB_LOG"
+if [[ "${1:-}" == "login" && "${2:-}" == "status" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "login" ]]; then
+  printf '{"tokens":{"access_token":"token_dev","refresh_token":"rt_dev","account_id":"acct_dev"}}\n' > "$CODEX_HOME/auth.json"
+  exit 0
+fi
+exit 0
+SCRIPT
+  chmod +x "$stub_dir/codex"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" CODEX_STUB_LOG="$log_file" NO_COLOR=1 \
+    CODEX_AUTH_USAGE_URL="http://127.0.0.1:9/unreachable" \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" add devprof --device-auth 2>&1)
+
+  assert_contains "$output" "device-auth login for profile 'devprof'"
+  assert_contains "$output" "Saved profile 'devprof'"
+  assert_contains "$(cat "$log_file")" "login --device-auth"
+  assert_contains "$(cat "$home_dir/accounts/profiles/devprof/auth.json")" "rt_dev"
+}
+
+test_add_failure_suggests_device_auth() {
+  local home_dir stub_dir output status=0
+  home_dir=$(mktemp -d)
+  stub_dir=$(mktemp -d)
+  cat > "$stub_dir/codex" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "login" ]]; then
+  echo "Token exchange error: token endpoint returned status 400 Bad Request" >&2
+  exit 1
+fi
+exit 0
+SCRIPT
+  chmod +x "$stub_dir/codex"
+
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" NO_COLOR=1 \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" add broken 2>&1) || status=$?
+
+  [[ $status -ne 0 ]] || fail "expected add to fail when codex login fails"
+  assert_contains "$output" "codex-auth add broken --device-auth"
+
+  # The device-auth run must not suggest itself again on failure.
+  output=$(PATH="$stub_dir:$PATH" CODEX_HOME="$home_dir" NO_COLOR=1 \
+    /bin/bash "$ROOT_DIR/bin/codex-auth" add broken --device-auth 2>&1) || true
+  assert_not_contains "$output" "Try the device-code flow"
+}
+
 test_add_stashes_live_auth_before_codex_login() {
   # `codex login`/`codex logout` revoke whatever tokens sit in auth.json at the
   # time they run. add must move the live auth aside first so logging into a
@@ -1937,6 +1994,8 @@ main() {
   test_refresh_tokens_uses_live_auth_chain_for_the_active_account
   test_refresh_tokens_rejects_success_response_without_tokens
   test_cron_run_preserves_rotation_error_across_usage_refresh
+  test_add_device_auth_passes_flag_to_codex_login
+  test_add_failure_suggests_device_auth
   test_add_stashes_live_auth_before_codex_login
   test_cron_implementation_avoids_nonportable_bash_and_date_flags
   test_list_skips_session_stats_by_default_and_with_stats_opts_in

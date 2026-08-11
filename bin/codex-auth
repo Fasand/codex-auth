@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.11.0"
+APP_VERSION="0.11.1"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -55,7 +55,10 @@ Commands:
   current [--utc]           Show the currently active auth profile or current auth summary
   save <name>               Save the current auth.json as a named profile
   switch [name]             Switch to a saved profile (interactive if name omitted)
-  add <name>                Stash live auth safely, run codex login, save the result as <name>
+  add <name> [--device-auth]
+                            Stash live auth safely, run codex login, save the result as <name>
+                            --device-auth uses a device code instead of a browser
+                            (for headless/remote machines, including WSL/SSH)
   refresh-usage [--utc] [--with-stats] [<name>|--all]
                             Query live usage for one profile, or all profiles when no name is given
   refresh [--utc] [--with-stats] [<name>|--all]
@@ -2194,6 +2197,7 @@ switch_profile() {
 
 add_profile() {
   local profile_name=$1
+  local device_auth=${2:-0}
   validate_profile_name "$profile_name"
   ensure_dirs
 
@@ -2231,9 +2235,15 @@ add_profile() {
     fi
   fi
 
-  note "Starting codex login for profile '$profile_name'..."
+  local -a login_args=(login)
+  if [[ "$device_auth" == "1" ]]; then
+    login_args+=(--device-auth)
+    note "Starting codex device-auth login for profile '$profile_name'..."
+  else
+    note "Starting codex login for profile '$profile_name'..."
+  fi
   local login_ok=1
-  "$CODEX_AUTH_CODEX_BIN" login || login_ok=0
+  "$CODEX_AUTH_CODEX_BIN" "${login_args[@]}" || login_ok=0
   if [[ $login_ok -eq 1 ]]; then
     "$CODEX_AUTH_CODEX_BIN" login status >/dev/null 2>&1 || login_ok=0
   fi
@@ -2243,6 +2253,10 @@ add_profile() {
       rm -f "$stash"
       trap - EXIT INT TERM
       note "codex login failed — restored previous auth.json"
+    fi
+    if [[ "$device_auth" != "1" ]]; then
+      note "Browser-based login can fail on headless/remote machines (curling the localhost URL does not work)."
+      note "Try the device-code flow instead:  codex-auth add $profile_name --device-auth"
     fi
     die "codex login did not complete successfully"
   fi
@@ -4274,8 +4288,26 @@ main() {
       ;;
     add)
       shift
-      [[ $# -eq 1 ]] || die "Usage: codex-auth add <name>"
-      add_profile "$1"
+      local add_target=""
+      local add_device_auth=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --device-auth)
+            [[ $add_device_auth -eq 0 ]] || die "Usage: codex-auth add <name> [--device-auth]"
+            add_device_auth=1
+            ;;
+          -*)
+            die "Usage: codex-auth add <name> [--device-auth]"
+            ;;
+          *)
+            [[ -z "$add_target" ]] || die "Usage: codex-auth add <name> [--device-auth]"
+            add_target="$1"
+            ;;
+        esac
+        shift
+      done
+      [[ -n "$add_target" ]] || die "Usage: codex-auth add <name> [--device-auth]"
+      add_profile "$add_target" "$add_device_auth"
       ;;
     stats|statistics)
       shift
