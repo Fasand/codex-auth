@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.11.1"
+APP_VERSION="0.12.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -15,6 +15,8 @@ CODEX_AUTH_CODEX_BIN="${CODEX_AUTH_CODEX_BIN:-codex}"
 DEFAULT_CRON_BASE_PATH="/usr/local/bin:/usr/bin:/bin"
 DEFAULT_USAGE_URL="https://chatgpt.com/backend-api/codex/usage"
 FALLBACK_USAGE_URL="https://chatgpt.com/backend-api/wham/usage"
+# Lists the account's earned usage-reset credits (count + per-credit expiry).
+DEFAULT_RESET_CREDITS_URL="https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 # OAuth constants matching the Codex CLI itself (extracted from the codex
 # binary); refresh-tokens performs the same grant the CLI performs on expiry.
 DEFAULT_TOKEN_URL="https://auth.openai.com/oauth/token"
@@ -438,7 +440,7 @@ refresh_usage_python() {
   local include_session=${3:-0}
   local session_json=${4:-}
   local profile_name=${5:-}
-  python3 - "$auth_path" "$usage_path" "$DEFAULT_USAGE_URL" "$FALLBACK_USAGE_URL" "$include_session" "$session_json" "$profile_name" "$APP_VERSION" <<'PY'
+  python3 - "$auth_path" "$usage_path" "$DEFAULT_USAGE_URL" "$FALLBACK_USAGE_URL" "$include_session" "$session_json" "$profile_name" "$APP_VERSION" "$DEFAULT_RESET_CREDITS_URL" <<'PY'
 import datetime as dt
 import json
 import os
@@ -447,7 +449,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-auth_path, usage_path, default_url, fallback_url, include_session, session_json, profile_name, app_version = sys.argv[1:9]
+auth_path, usage_path, default_url, fallback_url, include_session, session_json, profile_name, app_version, reset_credits_url = sys.argv[1:10]
 obj = json.loads(Path(auth_path).read_text())
 tokens = obj.get('tokens') or {}
 access_token = tokens.get('access_token')
@@ -517,6 +519,38 @@ def parse_error_payload(raw):
         'status': payload.get('status'),
     }
 
+def request_headers():
+    return {
+        'Authorization': f'Bearer {access_token}',
+        'ChatGPT-Account-Id': account_id,
+        'Accept': 'application/json',
+        'User-Agent': f'codex-auth/{app_version}',
+    }
+
+
+def fetch_reset_credits():
+    # Best effort: the usage payload already carries the count
+    # (rate_limit_reset_credits); this adds each available credit's expiry so
+    # the soonest-expiring one can be used first. Credit ids are not stored.
+    url = os.environ.get('CODEX_AUTH_RESET_CREDITS_URL') or ('' if custom_url else reset_credits_url)
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers=request_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+        credits = data.get('credits') or []
+        return {
+            'available_count': data.get('available_count'),
+            'expires_at': sorted(
+                str(c.get('expires_at')) for c in credits
+                if isinstance(c, dict) and c.get('status') == 'available' and c.get('expires_at')
+            ),
+        }
+    except Exception:
+        return None
+
+
 urls = []
 custom_url = os.environ.get('CODEX_AUTH_USAGE_URL')
 if custom_url:
@@ -526,15 +560,7 @@ else:
 
 last_error = None
 for url in urls:
-    req = urllib.request.Request(
-        url,
-        headers={
-            'Authorization': f'Bearer {access_token}',
-            'ChatGPT-Account-Id': account_id,
-            'Accept': 'application/json',
-            'User-Agent': f'codex-auth/{app_version}',
-        },
-    )
+    req = urllib.request.Request(url, headers=request_headers())
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode('utf-8', 'replace')
@@ -556,6 +582,9 @@ for url in urls:
                 'endpoint': 'primary' if (custom_url or url == default_url) else 'fallback',
             }
             payload.update(data)
+            reset_credits = fetch_reset_credits()
+            if reset_credits is not None:
+                payload['reset_credits'] = reset_credits
             payload['backend_derived'] = derived_from_backend(payload)
             payload['derived'] = dict(payload['backend_derived'])
             if include_session == '1' and session_json:
@@ -767,6 +796,39 @@ def percent_with_source(key):
     return text
 
 
+def format_date(value):
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return ''
+    if use_utc == '1':
+        return parsed.astimezone(dt.timezone.utc).strftime('%Y-%m-%d')
+    return parsed.astimezone(local_tz).strftime('%d %b')
+
+
+def window_reset(prefix, window_key):
+    # A window nobody has used yet reports reset = now + window length, which
+    # just moves with every refresh; hide it instead of showing a fake time.
+    after = derived.get(f'{prefix}_reset_after_seconds')
+    window = derived.get(window_key)
+    if after is not None and window and after >= window:
+        return ''
+    return format_datetime(first_value(derived.get(f'{prefix}_reset_at'), session.get(f'{prefix}_reset_at')))
+
+
+# Earned usage-reset credits: the count rides on the usage payload
+# (rate_limit_reset_credits); refresh also stores each credit's expiry.
+usage_resets = usage.get('rate_limit_reset_credits') or {}
+reset_credits = usage.get('reset_credits') or {}
+resets_count = first_value(reset_credits.get('available_count'), usage_resets.get('available_count'))
+resets_text = ''
+if resets_count is not None:
+    resets_text = str(resets_count)
+    if resets_count and (usage_resets.get('applicable_available_count') or 0) > 0:
+        resets_text += ' usable now'
+    expiries = reset_credits.get('expires_at') or []
+    if resets_count and expiries:
+        resets_text += f" · next exp {format_date(min(expiries))}"
+
 credits = usage.get('credits') or {}
 if credits.get('unlimited'):
     credits_text = 'unlimited'
@@ -781,20 +843,21 @@ payload = {
     'account': meta.get('accountId') or '',
     'plan': first_value(usage.get('plan_type'), session.get('plan_type')) or '',
     'credits': credits_text,
+    'resets': resets_text,
     'five_hour': percent_with_source('five_hour_remaining_percent'),
     'five_hour_label': window_label(first_value(
         derived.get('primary_window_seconds'),
         session.get('primary_window_seconds'),
         ((usage.get('rate_limit') or {}).get('primary_window') or {}).get('limit_window_seconds'),
     )) or '5h',
-    'five_hour_reset': format_datetime(first_value(derived.get('five_hour_reset_at'), session.get('five_hour_reset_at'))),
+    'five_hour_reset': window_reset('five_hour', 'primary_window_seconds'),
     'weekly': percent_with_source('weekly_remaining_percent'),
     'weekly_label': window_label(first_value(
         derived.get('secondary_window_seconds'),
         session.get('secondary_window_seconds'),
         ((usage.get('rate_limit') or {}).get('secondary_window') or {}).get('limit_window_seconds'),
     )) or 'weekly',
-    'weekly_reset': format_datetime(first_value(derived.get('weekly_reset_at'), session.get('weekly_reset_at'))),
+    'weekly_reset': window_reset('weekly', 'secondary_window_seconds'),
     'checked': format_datetime(usage.get('fetchedAt')),
     'token_expires': format_datetime(meta.get('tokenExpiresAt')),
     'last_refresh': format_datetime(meta.get('lastRefresh')),
@@ -866,6 +929,8 @@ if payload.get('plan'):
     parts.append(f"plan={paint(payload['plan'], 'CODEX_AUTH_THEME_PLAN_STYLE')}")
 if payload.get('credits'):
     parts.append(f"credits={paint(payload['credits'], 'CODEX_AUTH_THEME_COST_STYLE')}")
+if payload.get('resets'):
+    parts.append(f"resets={payload['resets']}")
 if payload.get('five_hour'):
     segment = f"{payload.get('five_hour_label') or '5h'} {percent_style(payload['five_hour'])}"
     if payload.get('five_hour_reset'):
@@ -940,6 +1005,9 @@ label2 = (window_label(derived.get('secondary_window_seconds')) or 'wk').ljust(3
 fiveh_col = pct(derived.get('five_hour_remaining_percent'))
 weekly_col = pct(derived.get('weekly_remaining_percent'))
 display = f"{active} {profile_col}  {email_col}  {label1} {fiveh_col}  {label2} {weekly_col}"
+resets = (usage.get('rate_limit_reset_credits') or {}).get('available_count')
+if resets:
+    display += f"  {resets} reset{'s' if resets != 1 else ''} left"
 print(f"{profile_name}	{display}")
 PY
 }
@@ -1162,7 +1230,7 @@ for row in display_rows:
         row[cell_key] = f"{row.get(label_key) or ''} {value}".strip() if value else ''
 
 profile_plain_cells = [("* " if row.get('active') else "  ") + (row.get('profile') or '') for row in display_rows]
-headers = ['PROFILE', 'EMAIL', 'PLAN', 'LIMIT', 'RESET', 'LIMIT 2', 'RESET', 'CHECKED']
+headers = ['PROFILE', 'EMAIL', 'PLAN', 'LIMIT', 'RESET', 'LIMIT 2', 'RESET', 'RESETS LEFT', 'CHECKED']
 columns = [
     profile_plain_cells,
     [row.get('email') or '' for row in display_rows],
@@ -1171,6 +1239,7 @@ columns = [
     [row.get('five_hour_reset') or '' for row in display_rows],
     [row.get('weekly_cell') or '' for row in display_rows],
     [row.get('weekly_reset') or '' for row in display_rows],
+    [row.get('resets') or '' for row in display_rows],
     [row.get('checked') or '' for row in display_rows],
 ]
 widths = []
@@ -1184,7 +1253,7 @@ def pad(value, width):
 
 def table_width():
     # Mirrors the fixed table layout without adding transient issue text to column widths.
-    return sum(widths) + 19
+    return sum(widths) + 22
 
 
 def issue_heading():
@@ -1209,7 +1278,8 @@ def render_row(index, header=False):
         headers[4] if header else pad(row.get('five_hour_reset') or '', widths[4]),
         headers[5] if header else pad(row.get('weekly_cell') or '', widths[5]),
         headers[6] if header else pad(row.get('weekly_reset') or '', widths[6]),
-        headers[7] if header else pad(row.get('checked') or '', widths[7]),
+        headers[7] if header else pad(row.get('resets') or '', widths[7]),
+        headers[8] if header else pad(row.get('checked') or '', widths[8]),
     ]
     if header:
         values = [pad(value, width) for value, width in zip(values, widths)]
@@ -1226,9 +1296,11 @@ def render_row(index, header=False):
             values[5] = percent_style(pad(row.get('weekly_cell') or '', widths[5]))
         if row.get('weekly_reset'):
             values[6] = paint(pad(row.get('weekly_reset') or '', widths[6]), 'CODEX_AUTH_THEME_RESET_STYLE')
+        if 'usable now' in (row.get('resets') or ''):
+            values[7] = paint(pad(row.get('resets') or '', widths[7]), 'CODEX_AUTH_THEME_PERCENT_OK_STYLE')
         if row.get('checked'):
-            values[7] = paint(pad(row.get('checked') or '', widths[7]), 'CODEX_AUTH_THEME_DIM_STYLE')
-    return f"{values[0]}  {values[1]}  {values[2]} | {values[3]}  {values[4]} | {values[5]}  {values[6]} | {values[7]}".rstrip()
+            values[8] = paint(pad(row.get('checked') or '', widths[8]), 'CODEX_AUTH_THEME_DIM_STYLE')
+    return f"{values[0]}  {values[1]}  {values[2]} | {values[3]}  {values[4]} | {values[5]}  {values[6]} | {values[7]} | {values[8]}".rstrip()
 
 
 print(render_row(0, header=True))

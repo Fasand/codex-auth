@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.11.1"
+EXPECTED_VERSION="0.12.0"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -336,13 +336,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+        if self.path.endswith("/reset-credits"):
+            body = {
+                "available_count": 2,
+                "credits": [
+                    {"id": "credit_late", "status": "available", "expires_at": "2026-12-12T20:44:07Z"},
+                    {"id": "credit_soon", "status": "available", "expires_at": "2026-12-01T21:58:30Z"},
+                    {"id": "credit_used", "status": "redeemed", "expires_at": "2026-11-20T00:00:00Z"},
+                ],
+            }
+            payload = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        # /usage-unused: a 5h window nobody has used yet (reset = now + window).
+        unused = self.path.endswith("/usage-unused")
         body = {
             "plan_type": "plus",
+            "rate_limit_reset_credits": {"available_count": 2, "applicable_available_count": 2 if unused else 0},
             "rate_limit": {
                 "primary_window": {
-                    "used_percent": 16,
+                    "used_percent": 0 if unused else 16,
                     "reset_at": 1774656360,
-                    "reset_after_seconds": 3600,
+                    "reset_after_seconds": 18000 if unused else 3600,
+                    "limit_window_seconds": 18000 if unused else None,
                 },
                 "secondary_window": {
                     "used_percent": 39,
@@ -515,7 +535,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-08-11"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-11-25"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
   assert_contains "$(cat "$ROOT_DIR/README.md")" "Current version: \`$EXPECTED_VERSION\`"
 }
@@ -1573,6 +1593,40 @@ test_refresh_marks_session_backfilled_percents_as_approximate() {
   trap - RETURN
 }
 
+test_refresh_shows_reset_credits_left_with_next_expiry() {
+  local home_dir port_file server_pid output base_url
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  cp "$home_dir/accounts/profiles/alpha/auth.json" "$home_dir/auth.json"
+
+  port_file=$(mktemp)
+  server_pid=$(start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  base_url="http://127.0.0.1:$(cat "$port_file")"
+
+  # Count only (no reset-credits endpoint): taken from the usage payload.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh --utc alpha 2>&1)
+  assert_contains "$output" "RESETS LEFT"
+  assert_contains "$output" "| 2 "
+  assert_not_contains "$output" "next exp"
+
+  # With the credits list: soonest expiry of the available credits; ids never stored.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh --utc alpha 2>&1)
+  assert_contains "$output" "2 · next exp 2026-12-01"
+  assert_not_contains "$(cat "$home_dir/accounts/profiles/alpha/usage.json")" "credit_"
+
+  # At the limit with usable credits; an unused window's moving reset time is hidden.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" refresh --utc alpha 2>&1)
+  assert_contains "$output" "2 usable now · next exp 2026-12-01"
+  assert_not_contains "$output" "2026-03-28"
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" current 2>&1)
+  assert_contains "$output" "resets=2 usable now"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
 test_list_marks_fallback_endpoint_usage_as_approximate() {
   local home_dir output
   home_dir=$(mktemp -d)
@@ -1968,6 +2022,7 @@ main() {
   test_refresh_live_fallback_requires_matching_live_account
   test_refresh_marks_session_backfilled_percents_as_approximate
   test_list_marks_fallback_endpoint_usage_as_approximate
+  test_refresh_shows_reset_credits_left_with_next_expiry
   test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta
