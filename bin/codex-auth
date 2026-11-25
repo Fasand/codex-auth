@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.12.0"
+APP_VERSION="0.13.0"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -65,6 +65,10 @@ Commands:
                             Query live usage for one profile, or all profiles when no name is given
   refresh [--utc] [--with-stats] [<name>|--all]
                             Alias for refresh-usage
+  reset <name> [--yes]      Redeem one usage-reset credit (the soonest-expiring) for that
+                            profile's account. Refuses unless a credit is usable now (the
+                            account is at a limit); without --yes it only says what it
+                            would do. Does not change the active profile.
   token-status [--utc] [<name>|--all]
                             Show saved ID/access token expiry metadata
                             Defaults to all profiles when no name is provided
@@ -2339,6 +2343,106 @@ add_profile() {
   render_profile_line "$profile_name" "$profile_name"
 }
 
+reset_command() {
+  ensure_dirs
+  local profile_name=$1
+  local confirmed=${2:-0}
+  validate_profile_name "$profile_name"
+  [[ -d "$(profile_dir "$profile_name")" ]] || die "Unknown profile '$profile_name'"
+  # Tests point the usage URL at a stub; never let them fall through to the
+  # live redeem endpoint.
+  if [[ -n "${CODEX_AUTH_USAGE_URL:-}" && -z "${CODEX_AUTH_RESET_CREDITS_URL:-}" ]]; then
+    die "CODEX_AUTH_USAGE_URL is set: also set CODEX_AUTH_RESET_CREDITS_URL so reset cannot reach the live endpoint"
+  fi
+  local active_name error usage_path
+  active_name=$(find_matching_profile || true)
+  usage_path=$(profile_usage_path "$profile_name")
+  error=$(refresh_usage_for_profile "$profile_name") || die "$error"
+  echo "Before:"
+  render_profile_line "$profile_name" "$active_name"
+  python3 - "$usage_path" "$profile_name" "$confirmed" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+usage = json.loads(Path(sys.argv[1]).read_text())
+name, confirmed = sys.argv[2], sys.argv[3] == '1'
+summary = usage.get('rate_limit_reset_credits') or {}
+available = summary.get('available_count') or 0
+usable = summary.get('applicable_available_count') or 0
+expiries = (usage.get('reset_credits') or {}).get('expires_at') or []
+if not available:
+    raise SystemExit(f"codex-auth: '{name}' has no reset credits left")
+if not usable:
+    raise SystemExit(f"codex-auth: '{name}' has {available} reset credit(s), but none is usable now (the account is not at a limit); nothing redeemed")
+if not confirmed:
+    soonest = f" (soonest expires {expiries[0]})" if expiries else ''
+    raise SystemExit(f"codex-auth: would redeem 1 of {available} reset credit(s) for '{name}'{soonest}. Re-run with --yes to redeem it.")
+PY
+  python3 - "$(profile_auth_path "$profile_name")" "${CODEX_AUTH_RESET_CREDITS_URL:-$DEFAULT_RESET_CREDITS_URL}" "$APP_VERSION" "$profile_name" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+auth_path, list_url, app_version, name = sys.argv[1:5]
+tokens = json.loads(Path(auth_path).read_text()).get('tokens') or {}
+headers = {
+    'Authorization': f"Bearer {tokens.get('access_token') or ''}",
+    'ChatGPT-Account-Id': tokens.get('account_id') or '',
+    'Accept': 'application/json',
+    'User-Agent': f'codex-auth/{app_version}',
+}
+
+
+def call(url, body=None):
+    req_headers = dict(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode('utf-8')
+        req_headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=data, headers=req_headers, method='GET' if data is None else 'POST')
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode('utf-8', 'replace'))
+
+
+# Same request the Codex CLI makes (openai/codex codex-rs/backend-client/src/
+# client/rate_limit_resets.rs): POST <list url>/consume with
+# {redeem_request_id: <idempotency key>, credit_id?: <id>}; the reply is
+# {code: reset|nothing_to_reset|no_credit|already_redeemed, windows_reset: n}.
+# A credit resets every window at once ("Full reset (Weekly + 5 hr)"); there is
+# no per-window option. We pass the soonest-expiring available credit.
+credits = []
+try:
+    listing = call(list_url)
+    credits = [c for c in listing.get('credits') or [] if isinstance(c, dict) and c.get('status') == 'available' and c.get('id')]
+    credits.sort(key=lambda c: str(c.get('expires_at') or '9999'))
+    body = {'redeem_request_id': str(uuid.uuid4())}
+    if credits:
+        body['credit_id'] = credits[0]['id']
+    result = call(list_url.rstrip('/') + '/consume', body)
+except urllib.error.HTTPError as exc:
+    raise SystemExit(f"codex-auth: reset for '{name}' failed: HTTP {exc.code}; run 'codex-auth refresh {name}' to check before trying again")
+except Exception as exc:
+    raise SystemExit(f"codex-auth: reset for '{name}' outcome unknown ({exc.__class__.__name__}); run 'codex-auth refresh {name}' to check before trying again")
+code = result.get('code')
+expires = f", credit expiring {credits[0].get('expires_at')}" if credits else ''
+messages = {
+    'reset': f"Redeemed 1 reset credit for '{name}': {result.get('windows_reset', 0)} window(s) reset{expires}",
+    'already_redeemed': f"This reset request was already redeemed for '{name}'",
+    'nothing_to_reset': f"Nothing to reset for '{name}'; no credit was used",
+    'no_credit': f"'{name}' has no reset credit left",
+}
+print(messages.get(code, f"Unexpected reset outcome for '{name}': {code}"))
+raise SystemExit(0 if code in ('reset', 'already_redeemed') else 1)
+PY
+  error=$(refresh_usage_for_profile "$profile_name") || die "$error"
+  echo "After:"
+  render_profile_line "$profile_name" "$active_name"
+}
+
 rename_profile() {
   local old_name=$1
   local new_name=$2
@@ -4441,6 +4545,23 @@ main() {
         shift
       done
       token_status_command "$token_status_target" "$token_status_use_utc"
+      ;;
+    reset)
+      shift
+      local reset_target="" reset_confirmed=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --yes|-y) reset_confirmed=1 ;;
+          -*) die "Usage: codex-auth reset <name> [--yes]" ;;
+          *)
+            [[ -z "$reset_target" ]] || die "Usage: codex-auth reset <name> [--yes]"
+            reset_target="$1"
+            ;;
+        esac
+        shift
+      done
+      [[ -n "$reset_target" ]] || die "Usage: codex-auth reset <name> [--yes]"
+      reset_command "$reset_target" "$reset_confirmed"
       ;;
     refresh-tokens)
       shift

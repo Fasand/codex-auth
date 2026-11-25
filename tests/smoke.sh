@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.12.0"
+EXPECTED_VERSION="0.13.0"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -302,6 +302,7 @@ start_mock_usage_server() {
   python3 -u - "$port_file" "$fail_tokens" "$bare_tokens" >/dev/null 2>&1 <<'PY' &
 import http.server
 import json
+import os
 import socketserver
 import sys
 
@@ -379,6 +380,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
+        if self.path.endswith("/reset-credits/consume"):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8")
+            log = os.environ.get("MOCK_CONSUME_LOG")
+            if log:
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(raw + "\n")
+            payload = json.dumps({"code": "reset", "credit": {"id": "x"}, "windows_reset": 2}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         # OAuth token endpoint stub for refresh-tokens: rotates tokens and
         # echoes the incoming refresh token so tests can assert which token
         # chain was replayed. Refresh tokens in fail_tokens get a 401.
@@ -1627,6 +1642,56 @@ test_refresh_shows_reset_credits_left_with_next_expiry() {
   trap - RETURN
 }
 
+test_reset_redeems_soonest_credit_only_with_yes_and_keeps_active_profile() {
+  local home_dir port_file server_pid output base_url consume_log status
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  create_profile_fixture "$home_dir" "beta" "beta@example.com" "acct_beta" "token_beta"
+  cp "$home_dir/accounts/profiles/beta/auth.json" "$home_dir/auth.json"
+  printf 'beta\n' > "$home_dir/accounts/current_profile"
+  consume_log=$(mktemp)
+  rm -f "$consume_log"
+
+  port_file=$(mktemp)
+  server_pid=$(MOCK_CONSUME_LOG="$consume_log" start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  base_url="http://127.0.0.1:$(cat "$port_file")"
+
+  # A stubbed usage URL without a stubbed credits URL must never reach the live endpoint.
+  status=0
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1) || status=$?
+  [[ $status -ne 0 ]] || fail "expected reset to refuse without CODEX_AUTH_RESET_CREDITS_URL"
+  assert_contains "$output" "CODEX_AUTH_RESET_CREDITS_URL"
+
+  # Not at a limit: nothing usable, nothing redeemed.
+  status=0
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1) || status=$?
+  [[ $status -ne 0 ]] || fail "expected reset to refuse when no credit is usable"
+  assert_contains "$output" "none is usable now"
+
+  # At a limit without --yes: says what it would do, redeems nothing.
+  status=0
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha 2>&1) || status=$?
+  [[ $status -ne 0 ]] || fail "expected reset without --yes to stop"
+  assert_contains "$output" "Re-run with --yes"
+  [[ ! -s "$consume_log" ]] || fail "expected no consume call before --yes"
+
+  # With --yes: one consume call for the soonest-expiring credit, before/after shown.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
+  assert_contains "$output" "Before:"
+  assert_contains "$output" "Redeemed 1 reset credit for 'alpha': 2 window(s) reset"
+  assert_contains "$output" "After:"
+  [[ $(wc -l < "$consume_log") -eq 1 ]] || fail "expected exactly one consume call"
+  assert_contains "$(cat "$consume_log")" '"credit_id": "credit_soon"'
+  assert_contains "$(cat "$consume_log")" '"redeem_request_id": "'
+  [[ "$(cat "$home_dir/accounts/current_profile")" == "beta" ]] || fail "expected active profile to stay beta"
+  cmp -s "$home_dir/auth.json" "$home_dir/accounts/profiles/beta/auth.json" || fail "expected live auth.json untouched"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
 test_list_marks_fallback_endpoint_usage_as_approximate() {
   local home_dir output
   home_dir=$(mktemp -d)
@@ -2023,6 +2088,7 @@ main() {
   test_refresh_marks_session_backfilled_percents_as_approximate
   test_list_marks_fallback_endpoint_usage_as_approximate
   test_refresh_shows_reset_credits_left_with_next_expiry
+  test_reset_redeems_soonest_credit_only_with_yes_and_keeps_active_profile
   test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta
