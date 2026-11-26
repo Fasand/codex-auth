@@ -640,7 +640,8 @@ test_switch_round_trip_preserves_the_saved_snapshot_byte_for_byte() {
 {"auth_mode":"chatgpt","last_refresh":"2026-06-04T10:28:41Z","tokens":{"access_token":"$access_token","id_token":"$id_token","refresh_token":"refresh_alpha_R1","account_id":"acct_alpha"}}
 JSON
 
-  PATH="$codex_dir:$PATH" CODEX_HOME="$home_dir" /bin/bash "$ROOT_DIR/bin/codex-auth" save alpha >/dev/null 2>&1
+  # Port 9 (discard) refuses at once: save's usage refresh must not reach the live endpoint.
+  PATH="$codex_dir:$PATH" CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="http://127.0.0.1:9/usage" /bin/bash "$ROOT_DIR/bin/codex-auth" save alpha >/dev/null 2>&1
   # A pristine copy of what account A looked like when it was saved.
   local saved_alpha
   saved_alpha=$(mktemp)

@@ -1,0 +1,7 @@
+{
+ "project": "codex-auth",
+ "route_map": "complete",
+ "routes": {},
+ "cli_paths": ["bin/**", "install.sh", "completions/**"],
+ "smoke": []
+}
