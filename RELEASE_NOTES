@@ -1,2 +1,4 @@
 0.11.0	IMPORTANT: never switch accounts with 'codex logout' or bare 'codex login' — both revoke the live account's tokens server-side and kill its saved profile. Log new accounts in with 'codex-auth add <name>' (it stashes live auth safely first) and swap with 'codex-auth switch'. New 'codex-auth refresh-tokens' keeps saved tokens alive without spending model usage; existing cron jobs use it automatically — no reconfiguration needed. Run 'codex-auth cron setup' if you have no cron job yet.
 0.11.1	'codex-auth add <name> --device-auth' logs in with a device code instead of a browser — use it on headless/remote machines (WSL, SSH) where the localhost browser flow fails.
+0.12.0	'codex-auth list' and 'refresh' now show the usage resets each account has left and when the next one expires.
+0.13.0	New 'codex-auth reset <name> --yes' redeems one usage reset (the soonest-expiring) for that account without switching to it; run it only when the profile shows 'usable now'.

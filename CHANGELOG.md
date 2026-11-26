@@ -2,6 +2,15 @@
 
 Newest releases go at the top.
 
+## 0.13.0 - 2026-11-25
+
+- Added `codex-auth reset <name> [--yes]`: redeems one usage-reset credit (the soonest-expiring) for that profile's account with the same request the Codex CLI uses (`POST /backend-api/wham/rate-limit-reset-credits/consume`), and shows the profile's limits before and after. It refuses unless the account is at a limit with a credit usable now, only says what it would do without `--yes`, and never changes the active profile.
+
+## 0.12.0 - 2026-11-25
+
+- `list`, `refresh`, `current` and the switch picker now show how many usage-reset credits each account has left (`RESETS LEFT`), mark them `usable now` when the account is at its limit, and show when the soonest one expires. Refresh reads the credit list from `/backend-api/wham/rate-limit-reset-credits` (best effort; ids are never stored) and keeps the expiries in `usage.json` under `reset_credits` for scripts.
+- An unused limit window no longer shows a reset time that just moved with every refresh (now + window length).
+
 ## 0.11.1 - 2026-08-11
 
 - `codex-auth add <name> --device-auth` runs `codex login --device-auth` (device-code flow) for headless/remote machines where the browser + localhost callback flow fails — curling the printed localhost URL cannot complete the OAuth exchange.

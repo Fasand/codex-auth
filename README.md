@@ -4,7 +4,7 @@ Manage multiple ChatGPT Codex `auth.json` profiles from the command line.
 
 `codex-auth` is a small, practical utility for saving, switching, listing, and refreshing multiple Codex login profiles. It is vibe-coded in the best sense: built quickly, kept useful, and polished enough to share.
 
-Current version: `0.11.1`
+Current version: `0.13.0`
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -214,6 +214,9 @@ Run `codex-auth help` for the full command reference.
 
 - `codex-auth refresh-usage` and `codex-auth refresh` refresh **usage data** from ChatGPT Codex usage endpoints. They do not perform a Codex OAuth token refresh by themselves.
 - `codex-auth refresh-usage` or `codex-auth refresh` with no profile name refreshes every saved profile directly, same as `--all`.
+- The `RESETS LEFT` column shows how many earned usage-reset credits ("Full reset (Weekly + 5 hr)") the account still holds, `usable now` when the account is at its limit so a reset would take effect, and the date the soonest credit expires. The count comes from the usage payload (`rate_limit_reset_credits`); refresh also reads `/backend-api/wham/rate-limit-reset-credits` and stores each credit's expiry (never its id) in the profile's `usage.json` under `reset_credits`.
+- `codex-auth reset <name> --yes` redeems one of those credits (the soonest-expiring) for that profile's account, using the same `POST /backend-api/wham/rate-limit-reset-credits/consume` request as the Codex CLI. A credit resets every window at once. It refuses unless the profile is `usable now`, prints the limits before and after, and does not switch the active profile. Without `--yes` it only says what it would do.
+- A limit window nobody has used yet shows no reset time (the backend reports now + window length, which moves with every refresh).
 - Percentages prefixed with `~` are approximate: they were backfilled from the latest local Codex session snapshot (recent rollouts only) or fetched from the fallback usage endpoint, rather than coming straight from the primary usage endpoint.
 - Multi-profile refreshes show progress as each profile is processed; interactive terminals use a single live-updating line, while non-interactive output stays line-based.
 - If one or more profiles fail to refresh, the command still finishes the rest of the batch, prints the updated profile list, and then summarizes the failures before exiting non-zero.

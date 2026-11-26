@@ -20,7 +20,7 @@ _codex_auth_completion() {
   prev="${COMP_WORDS[COMP_CWORD-1]:-}"
   first="${COMP_WORDS[1]:-}"
 
-  local commands="list current save switch add refresh-usage refresh refresh-tokens token-status touch cron stats statistics update rename remove rm delete help"
+  local commands="list current save switch add refresh-usage refresh reset refresh-tokens token-status touch cron stats statistics update rename remove rm delete help"
   local profiles
   profiles="$(_codex_auth_profile_names | tr '\n' ' ')"
 
@@ -80,6 +80,10 @@ _codex_auth_completion() {
       ;;
     refresh-tokens)
       COMPREPLY=( $(compgen -W "--all --force $profiles" -- "$cur") )
+      return 0
+      ;;
+    reset)
+      COMPREPLY=( $(compgen -W "--yes $profiles" -- "$cur") )
       return 0
       ;;
     list)
@@ -154,6 +158,11 @@ _codex_auth_completion() {
 
   if [[ "$first" == "touch" ]]; then
     COMPREPLY=( $(compgen -W "--all $profiles" -- "$cur") )
+    return 0
+  fi
+
+  if [[ "$first" == "reset" ]]; then
+    COMPREPLY=( $(compgen -W "--yes $profiles" -- "$cur") )
     return 0
   fi
 
