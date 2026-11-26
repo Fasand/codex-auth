@@ -2457,14 +2457,33 @@ PY
     fi
     (( i == tries )) || sleep "${CODEX_AUTH_RESET_POLL_SECONDS:-5}"
   done
-  echo "Redeemed; the server has not refreshed the figures yet. Check again in a minute: codex-auth refresh $profile_name"
-  [[ -z "$read_error" ]] || note "Last usage read failed: $read_error"
+  if [[ -n "$read_error" ]]; then
+    echo "Redeemed; could not read the updated usage ($read_error). Check again in a minute: codex-auth refresh $profile_name"
+  else
+    echo "Redeemed; the server has not refreshed the figures yet. Check again in a minute: codex-auth refresh $profile_name"
+  fi
 }
 
 # Endpoint plus used percentages: an unused window's reset time moves on every
 # fetch, and the fallback endpoint counts a different limit bucket.
 usage_used_percents() {
-  python3 -c 'import json, sys; u = json.load(open(sys.argv[1])); d = u.get("backend_derived") or {}; print(json.dumps([u.get("endpoint"), d.get("five_hour_used_percent"), d.get("weekly_used_percent")]))' "$1"
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+usage = json.load(open(sys.argv[1]))
+derived = usage.get('backend_derived') or {}
+
+
+def percent(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+print(json.dumps([usage.get('endpoint'), percent(derived.get('five_hour_used_percent')), percent(derived.get('weekly_used_percent'))]))
+PY
 }
 
 # True when a window reported by the same endpoint before and now has moved.
