@@ -1710,12 +1710,12 @@ test_reset_after_waits_for_the_server_to_apply_the_redeem() {
   home_dir=$(mktemp -d)
   create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
   port_file=$(mktemp)
-  server_pid=$(MOCK_CONSUME_LOG=/dev/null MOCK_RESET_LAG=2 start_mock_usage_server "$port_file")
+  server_pid=$(MOCK_CONSUME_LOG=/dev/null MOCK_RESET_LAG=6 start_mock_usage_server "$port_file")
   trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
   wait_for_file "$port_file" || fail "mock usage server did not start"
   base_url="http://127.0.0.1:$(cat "$port_file")"
 
-  # The first read after the redeem is still stale; the second shows weekly 100 % left.
+  # Reads 1-5 after the redeem are stale; the 6th (the default budget) shows weekly 100 % left.
   output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" CODEX_AUTH_RESET_POLL_SECONDS=0 /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
   assert_contains "$output" "After:"
   assert_not_contains "$output" "has not refreshed"

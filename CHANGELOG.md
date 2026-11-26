@@ -4,7 +4,7 @@ Newest releases go at the top.
 
 ## 0.13.1 - 2026-11-26
 
-- `reset`: the After line no longer shows stale figures right after a redeem. It re-reads the usage until the used percentages move (up to about 30 seconds) and otherwise says the server has not refreshed the figures yet.
+- `reset`: the After line no longer shows stale figures right after a redeem. It re-reads the usage until the used percentages move (up to six reads, 5 seconds apart; a failed read only costs one attempt) and otherwise says the server has not refreshed the figures yet.
 
 ## 0.13.0 - 2026-11-25
 
