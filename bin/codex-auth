@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.13.0"
+APP_VERSION="0.13.1"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -2379,6 +2379,8 @@ if not confirmed:
     soonest = f" (soonest expires {expiries[0]})" if expiries else ''
     raise SystemExit(f"codex-auth: would redeem 1 of {available} reset credit(s) for '{name}'{soonest}. Re-run with --yes to redeem it.")
 PY
+  local before_figures
+  before_figures=$(usage_used_percents "$usage_path")
   python3 - "$(profile_auth_path "$profile_name")" "${CODEX_AUTH_RESET_CREDITS_URL:-$DEFAULT_RESET_CREDITS_URL}" "$APP_VERSION" "$profile_name" <<'PY'
 import json
 import sys
@@ -2438,9 +2440,65 @@ messages = {
 print(messages.get(code, f"Unexpected reset outcome for '{name}': {code}"))
 raise SystemExit(0 if code in ('reset', 'already_redeemed') else 1)
 PY
-  error=$(refresh_usage_for_profile "$profile_name") || die "$error"
-  echo "After:"
-  render_profile_line "$profile_name" "$active_name"
+  # The server applies a redeem with a lag, so a refresh right after it can
+  # still show the old figures: poll until the used percentages move. A failed
+  # read only costs one attempt; the credit is already spent.
+  local tries=${CODEX_AUTH_RESET_POLL_TRIES:-6} i read_error=""
+  for ((i = 1; i <= tries; i++)); do
+    if error=$(refresh_usage_for_profile "$profile_name"); then
+      read_error=""
+      if usage_moved "$before_figures" "$usage_path"; then
+        echo "After:"
+        render_profile_line "$profile_name" "$active_name"
+        return 0
+      fi
+    else
+      read_error=$error
+    fi
+    (( i == tries )) || sleep "${CODEX_AUTH_RESET_POLL_SECONDS:-5}"
+  done
+  if [[ -n "$read_error" ]]; then
+    echo "Redeemed; could not read the updated usage ($read_error). Check again in a minute: codex-auth refresh $profile_name"
+  else
+    echo "Redeemed; the server has not refreshed the figures yet. Check again in a minute: codex-auth refresh $profile_name"
+  fi
+}
+
+# Endpoint plus used percentages: an unused window's reset time moves on every
+# fetch, and the fallback endpoint counts a different limit bucket.
+usage_used_percents() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+usage = json.load(open(sys.argv[1]))
+derived = usage.get('backend_derived') or {}
+
+
+def percent(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+print(json.dumps([usage.get('endpoint'), percent(derived.get('five_hour_used_percent')), percent(derived.get('weekly_used_percent'))]))
+PY
+}
+
+# True when a window reported by the same endpoint before and now has moved.
+usage_moved() {
+  python3 - "$1" "$(usage_used_percents "$2")" <<'PY'
+import json
+import sys
+
+before, now = (json.loads(arg) for arg in sys.argv[1:3])
+moved = before[0] == now[0] and any(
+    isinstance(a, (int, float)) and isinstance(b, (int, float)) and a != b
+    for a, b in zip(before[1:], now[1:])
+)
+raise SystemExit(0 if moved else 1)
+PY
 }
 
 rename_profile() {

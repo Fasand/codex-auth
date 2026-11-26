@@ -2,6 +2,10 @@
 
 Newest releases go at the top.
 
+## 0.13.1 - 2026-11-26
+
+- `reset`: the After line no longer shows stale figures right after a redeem. It re-reads the usage until the used percentages move (up to six reads, 5 seconds apart; a failed read only costs one attempt) and otherwise says the server has not refreshed the figures yet.
+
 ## 0.13.0 - 2026-11-25
 
 - Added `codex-auth reset <name> [--yes]`: redeems one usage-reset credit (the soonest-expiring) for that profile's account with the same request the Codex CLI uses (`POST /backend-api/wham/rate-limit-reset-credits/consume`), and shows the profile's limits before and after. It refuses unless the account is at a limit with a credit usable now, only says what it would do without `--yes`, and never changes the active profile.
