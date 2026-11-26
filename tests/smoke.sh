@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-EXPECTED_VERSION="0.13.0"
+EXPECTED_VERSION="0.13.1"
 
 # Keep the daily update check inert for every test; update-check tests
 # re-enable it explicitly with CODEX_AUTH_NO_UPDATE_CHECK=0.
@@ -311,6 +311,9 @@ fail_tokens = {token for token in sys.argv[2].split(',') if token}
 bare_tokens = {token for token in sys.argv[3].split(',') if token}
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    consumed = False
+    reads_after_consume = 0
+
     def do_GET(self):
         auth = self.headers.get("Authorization", "")
         token = auth.removeprefix("Bearer ").strip()
@@ -355,6 +358,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         # /usage-unused: a 5h window nobody has used yet (reset = now + window).
         unused = self.path.endswith("/usage-unused")
+        # MOCK_RESET_LAG=n: the n-th usage read after a consume shows the
+        # windows reset (unset: the server never catches up).
+        lag = os.environ.get("MOCK_RESET_LAG")
+        applied = False
+        if unused and Handler.consumed and lag:
+            Handler.reads_after_consume += 1
+            applied = Handler.reads_after_consume >= int(lag)
         body = {
             "plan_type": "plus",
             "rate_limit_reset_credits": {"available_count": 2, "applicable_available_count": 2 if unused else 0},
@@ -366,7 +376,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "limit_window_seconds": 18000 if unused else None,
                 },
                 "secondary_window": {
-                    "used_percent": 39,
+                    "used_percent": 0 if applied else 39,
                     "reset_at": 1774829160,
                     "reset_after_seconds": 86400,
                 },
@@ -387,6 +397,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if log:
                 with open(log, "a", encoding="utf-8") as fh:
                     fh.write(raw + "\n")
+            Handler.consumed = True
             payload = json.dumps({"code": "reset", "credit": {"id": "x"}, "windows_reset": 2}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -550,7 +561,7 @@ test_install_script_avoids_unsafe_array_expansion_in_dependency_report() {
 test_changelog_tracks_the_current_release_newest_first() {
   local changelog
   changelog=$(cat "$ROOT_DIR/CHANGELOG.md")
-  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-11-25"
+  assert_contains "$changelog" "## $EXPECTED_VERSION - 2026-11-26"
   assert_contains "$changelog" "## 0.2.2 - 2026-03-19"
   assert_contains "$(cat "$ROOT_DIR/README.md")" "Current version: \`$EXPECTED_VERSION\`"
 }
@@ -1677,16 +1688,38 @@ test_reset_redeems_soonest_credit_only_with_yes_and_keeps_active_profile() {
   assert_contains "$output" "Re-run with --yes"
   [[ ! -s "$consume_log" ]] || fail "expected no consume call before --yes"
 
-  # With --yes: one consume call for the soonest-expiring credit, before/after shown.
-  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
+  # With --yes: one consume call for the soonest-expiring credit. This server
+  # never applies it, so stale figures are not shown as After.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" CODEX_AUTH_RESET_POLL_SECONDS=0 CODEX_AUTH_RESET_POLL_TRIES=3 /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
   assert_contains "$output" "Before:"
   assert_contains "$output" "Redeemed 1 reset credit for 'alpha': 2 window(s) reset"
-  assert_contains "$output" "After:"
+  assert_contains "$output" "the server has not refreshed the figures yet"
+  assert_not_contains "$output" "After:"
   [[ $(wc -l < "$consume_log") -eq 1 ]] || fail "expected exactly one consume call"
   assert_contains "$(cat "$consume_log")" '"credit_id": "credit_soon"'
   assert_contains "$(cat "$consume_log")" '"redeem_request_id": "'
   [[ "$(cat "$home_dir/accounts/current_profile")" == "beta" ]] || fail "expected active profile to stay beta"
   cmp -s "$home_dir/auth.json" "$home_dir/accounts/profiles/beta/auth.json" || fail "expected live auth.json untouched"
+
+  kill "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+}
+
+test_reset_after_waits_for_the_server_to_apply_the_redeem() {
+  local home_dir port_file server_pid output base_url
+  home_dir=$(mktemp -d)
+  create_profile_fixture "$home_dir" "alpha" "alpha@example.com" "acct_alpha" "token_alpha"
+  port_file=$(mktemp)
+  server_pid=$(MOCK_CONSUME_LOG=/dev/null MOCK_RESET_LAG=2 start_mock_usage_server "$port_file")
+  trap 'kill "${server_pid:-}" >/dev/null 2>&1 || true' RETURN
+  wait_for_file "$port_file" || fail "mock usage server did not start"
+  base_url="http://127.0.0.1:$(cat "$port_file")"
+
+  # The first read after the redeem is still stale; the second shows weekly 100 % left.
+  output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" CODEX_AUTH_RESET_POLL_SECONDS=0 /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
+  assert_contains "$output" "After:"
+  assert_not_contains "$output" "has not refreshed"
+  assert_contains "${output#*After:}" "100%"
 
   kill "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
@@ -2089,6 +2122,7 @@ main() {
   test_list_marks_fallback_endpoint_usage_as_approximate
   test_refresh_shows_reset_credits_left_with_next_expiry
   test_reset_redeems_soonest_credit_only_with_yes_and_keeps_active_profile
+  test_reset_after_waits_for_the_server_to_apply_the_redeem
   test_refresh_ignores_stale_session_snapshots
   test_refresh_continues_after_profile_failures_and_summarizes
   test_save_tracks_id_and_access_token_expiry_in_meta

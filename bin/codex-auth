@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_VERSION="0.13.0"
+APP_VERSION="0.13.1"
 export CODEX_AUTH_APP_VERSION="$APP_VERSION"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 AUTH_FILE="$CODEX_HOME/auth.json"
@@ -2379,6 +2379,8 @@ if not confirmed:
     soonest = f" (soonest expires {expiries[0]})" if expiries else ''
     raise SystemExit(f"codex-auth: would redeem 1 of {available} reset credit(s) for '{name}'{soonest}. Re-run with --yes to redeem it.")
 PY
+  local before_figures
+  before_figures=$(usage_used_percents "$usage_path")
   python3 - "$(profile_auth_path "$profile_name")" "${CODEX_AUTH_RESET_CREDITS_URL:-$DEFAULT_RESET_CREDITS_URL}" "$APP_VERSION" "$profile_name" <<'PY'
 import json
 import sys
@@ -2438,9 +2440,24 @@ messages = {
 print(messages.get(code, f"Unexpected reset outcome for '{name}': {code}"))
 raise SystemExit(0 if code in ('reset', 'already_redeemed') else 1)
 PY
-  error=$(refresh_usage_for_profile "$profile_name") || die "$error"
-  echo "After:"
-  render_profile_line "$profile_name" "$active_name"
+  # The server applies a redeem with a lag, so a refresh right after it can
+  # still show the old figures: poll until the used percentages move.
+  local tries=${CODEX_AUTH_RESET_POLL_TRIES:-6} i
+  for ((i = 1; i <= tries; i++)); do
+    error=$(refresh_usage_for_profile "$profile_name") || die "$error"
+    if [[ "$(usage_used_percents "$usage_path")" != "$before_figures" ]]; then
+      echo "After:"
+      render_profile_line "$profile_name" "$active_name"
+      return 0
+    fi
+    (( i == tries )) || sleep "${CODEX_AUTH_RESET_POLL_SECONDS:-5}"
+  done
+  echo "Redeemed; the server has not refreshed the figures yet. Check again in a minute: codex-auth refresh $profile_name"
+}
+
+# Used percentages only: an unused window's reset time moves on every fetch.
+usage_used_percents() {
+  python3 -c 'import json, sys; d = json.load(open(sys.argv[1])).get("backend_derived") or {}; print(d.get("five_hour_used_percent"), d.get("weekly_used_percent"))' "$1"
 }
 
 rename_profile() {
