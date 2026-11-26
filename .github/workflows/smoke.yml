@@ -12,7 +12,9 @@ on:
       - main
 
 concurrency:
-  group: smoke-${{ github.ref }}
+  # PR runs share a group so a new push cancels the old run; every main push
+  # gets its own group, so none is queued behind or dropped.
+  group: smoke-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -20,7 +22,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A green run takes under a minute; a hung macOS run once sat until the
     # 15-minute cancel (SP-2564).
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
