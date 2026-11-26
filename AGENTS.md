@@ -50,3 +50,12 @@ The versioning/tag/changelog rules below are the canonical copy for this repo; t
   - `bash -n tests/smoke.sh`
   - `bash tests/smoke.sh`
 - PR checks should run on the PR itself; pushes to `main` validate post-merge.
+
+## For governor leads
+
+- Ledger project `small-projects`; items show as `SP-n`. One worktree per item under `.worktrees/`.
+- CI is `.github/workflows/smoke.yml`: `bash tests/smoke.sh` on hosted ubuntu and macOS. It stays off the devbox runner pool because the repo is public (fork-PR policy in `reference-architecture/ops/github-runners/README.md`).
+- macOS runs `/bin/bash` 3.2. To check a change against it locally, run `docker run --rm -v "$PWD":/w:ro bash:3.2 sh -c 'apk add -q python3 coreutils git curl; ln -sf /usr/local/bin/bash /bin/bash; cp -r /w /t && cd /t && bash tests/smoke.sh'`.
+- Gate: `governor qa gate DEV-n --repo . --base origin/main --wait`. With no UI (`qa/qa.json` maps no routes) it checks T0 (this PR's CI is green) and T4 (no regression rows), and skips the screenshot tiers. A package has no `test_url`; Petr tries the PR's self-test install command.
+- Tests never reach live OpenAI endpoints: they point `CODEX_AUTH_USAGE_URL`, `CODEX_AUTH_RESET_CREDITS_URL` and `CODEX_AUTH_TOKEN_URL` at the mock server in `tests/smoke.sh`. `reset` refuses to run with a stubbed usage URL and no stubbed credits URL.
+- Releases: after Petr's Approve merges the PR, tag the squash commit on `main` with the plain version (`git tag 0.x.y origin/main && git push origin 0.x.y`) and prune tags as described in Release tags above.

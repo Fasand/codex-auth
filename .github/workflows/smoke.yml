@@ -1,14 +1,26 @@
 name: smoke
 
+# Hosted runners on purpose: this repo is public, and the devbox pool must never
+# take a public repo (a fork PR can rewrite runs-on and reach the host's docker
+# socket; reference-architecture/ops/github-runners/README.md, fork-PR policy).
+# Hosted minutes are free for public repos.
+
 on:
   pull_request:
   push:
     branches:
       - main
 
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   smoke:
     runs-on: ${{ matrix.os }}
+    # A green run takes under a minute; a hung macOS run once sat until the
+    # 15-minute cancel (SP-2564).
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
