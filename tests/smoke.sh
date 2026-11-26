@@ -1719,7 +1719,7 @@ test_reset_after_waits_for_the_server_to_apply_the_redeem() {
   output=$(NO_COLOR=1 CODEX_HOME="$home_dir" CODEX_AUTH_USAGE_URL="$base_url/usage-unused" CODEX_AUTH_RESET_CREDITS_URL="$base_url/reset-credits" CODEX_AUTH_RESET_POLL_SECONDS=0 /bin/bash "$ROOT_DIR/bin/codex-auth" reset alpha --yes 2>&1)
   assert_contains "$output" "After:"
   assert_not_contains "$output" "has not refreshed"
-  assert_contains "${output#*After:}" "100%"
+  assert_contains "${output#*After:}" "weekly 100%"
 
   kill "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
